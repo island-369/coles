@@ -148,17 +148,12 @@ class MetricsTracker(Callback):
         if self.epoch_start_time:
             print_time_point(f"Epoch {trainer.current_epoch} 训练结束", self.epoch_start_time)
         
-        # 只在主进程中记录指标，避免重复记录
-        if not trainer.is_global_zero:
-            return
-            
         # 调试：打印所有可用的指标键
-        debug_print(f"\n=== Epoch {trainer.current_epoch} Train End (Main Process) ===")
+        debug_print(f"\n=== Epoch {trainer.current_epoch} Train End ===")
         debug_print(f"Available callback_metrics keys: {list(trainer.callback_metrics.keys())}")
-        debug_print(f"Available logged_metrics keys: {list(trainer.logged_metrics.keys())}")
         debug_print(f"All callback_metrics: {trainer.callback_metrics}")
         
-        # 优先从callback_metrics获取聚合后的训练损失
+        # 尝试多种可能的训练损失键名
         train_loss = None
         for key in ['train_loss', 'loss', 'train/loss']:
             if key in trainer.callback_metrics:
@@ -166,19 +161,37 @@ class MetricsTracker(Callback):
                 debug_print(f"Found aggregated train loss with key '{key}' from callback_metrics: {train_loss:.4f}")
                 break
         
-        # 如果callback_metrics中没有，再尝试logged_metrics
-        if train_loss is None:
-            for key in ['train_loss', 'loss', 'train/loss']:
-                if key in trainer.logged_metrics:
-                    train_loss = trainer.logged_metrics[key].item()
-                    debug_print(f"Found train loss with key '{key}' from logged_metrics: {train_loss:.4f}")
-                    break
-        
         if train_loss is not None:
             self.train_losses.append(train_loss)
             debug_print(f"Epoch {trainer.current_epoch}: Train Loss = {train_loss:.4f}")
         else:
-            debug_print(f"Warning: No train loss found in callback_metrics or logged_metrics")
+            debug_print(f"Warning: No train loss found in callback_metrics")
+            
+        # 在训练 epoch 结束时也尝试记录验证指标
+        val_metric = None
+        for key in ['valid/recall_top_k', 'valid/BatchRecallTopK', 'val_recall_top_k', 'recall_top_k']:
+            if key in trainer.callback_metrics:
+                val_metric = trainer.callback_metrics[key].item()
+                debug_print(f"Found aggregated validation metric with key '{key}' from callback_metrics: {val_metric:.4f}")
+                break
+        
+        if val_metric is not None:
+            # 检查是否已经记录过当前 epoch 的验证指标，避免重复记录
+            if trainer.current_epoch not in self.epochs:
+                self.val_metrics.append(val_metric)
+                self.epochs.append(trainer.current_epoch)
+                debug_print(f"Epoch {trainer.current_epoch}: Val Recall@TopK recorded at Train End = {val_metric:.4f}")
+            else:
+                # 如果已经记录过，检查值是否一致
+                epoch_index = self.epochs.index(trainer.current_epoch)
+                previous_val_metric = self.val_metrics[epoch_index]
+                if abs(previous_val_metric - val_metric) > 1e-6:  # 使用小的阈值比较浮点数
+                    debug_print(f"Epoch {trainer.current_epoch}: Val Recall@TopK value changed from {previous_val_metric:.4f} to {val_metric:.4f}, updating record.")
+                    self.val_metrics[epoch_index] = val_metric
+                else:
+                    debug_print(f"Epoch {trainer.current_epoch}: Val Recall@TopK already recorded with same value {val_metric:.4f}.")
+        else:
+            debug_print(f"Warning: No validation metric found in callback_metrics at Train End")
     
     def on_validation_epoch_start(self, trainer, pl_module):
         """验证epoch开始时记录时间"""
@@ -190,17 +203,12 @@ class MetricsTracker(Callback):
         if self.validation_start_time:
             print_time_point(f"Epoch {trainer.current_epoch} 验证结束", self.validation_start_time)
         
-        # 只在主进程中记录指标，避免重复记录
-        if not trainer.is_global_zero:
-            return
-            
         # 调试：打印所有可用的指标键
-        debug_print(f"\n=== Epoch {trainer.current_epoch} Validation End (Main Process) ===")
+        debug_print(f"\n=== Epoch {trainer.current_epoch} Validation End ===")
         debug_print(f"Available callback_metrics keys: {list(trainer.callback_metrics.keys())}")
-        debug_print(f"Available logged_metrics keys: {list(trainer.logged_metrics.keys())}")
         debug_print(f"All callback_metrics: {trainer.callback_metrics}")
         
-        # 优先从callback_metrics获取聚合后的验证指标（recall@top_k）
+        # 尝试多种可能的验证指标键名（recall@top_k）
         val_metric = None
         for key in ['valid/recall_top_k', 'valid/BatchRecallTopK', 'val_recall_top_k', 'recall_top_k']:
             if key in trainer.callback_metrics:
@@ -208,31 +216,23 @@ class MetricsTracker(Callback):
                 debug_print(f"Found aggregated validation metric with key '{key}' from callback_metrics: {val_metric:.4f}")
                 break
         
-        # 如果callback_metrics中没有，再尝试logged_metrics
-        if val_metric is None:
-            for key in ['valid/recall_top_k', 'valid/BatchRecallTopK', 'val_recall_top_k', 'recall_top_k']:
-                if key in trainer.logged_metrics:
-                    val_metric = trainer.logged_metrics[key].item()
-                    debug_print(f"Found validation metric with key '{key}' from logged_metrics: {val_metric:.4f}")
-                    break
-        
         if val_metric is not None:
-            # 检查是否已经记录过当前 epoch 的验证指标，避免重复记录
+             # 检查是否已经记录过当前 epoch 的验证指标，避免重复记录
             if trainer.current_epoch not in self.epochs:
                 self.val_metrics.append(val_metric)
                 self.epochs.append(trainer.current_epoch)
-                debug_print(f"Epoch {trainer.current_epoch}: Aggregated Val Recall@TopK recorded = {val_metric:.4f}")
+                debug_print(f"Epoch {trainer.current_epoch}: Val Recall@TopK recorded at Validation End = {val_metric:.4f}")
             else:
                 # 如果已经记录过，检查值是否一致
                 epoch_index = self.epochs.index(trainer.current_epoch)
                 previous_val_metric = self.val_metrics[epoch_index]
                 if abs(previous_val_metric - val_metric) > 1e-6:  # 使用小的阈值比较浮点数
-                    debug_print(f"Epoch {trainer.current_epoch}: Aggregated Val Recall@TopK value changed from {previous_val_metric:.4f} to {val_metric:.4f}, updating record.")
+                    debug_print(f"Epoch {trainer.current_epoch}: Val Recall@TopK value changed from {previous_val_metric:.4f} to {val_metric:.4f}, updating record.")
                     self.val_metrics[epoch_index] = val_metric
                 else:
-                    debug_print(f"Epoch {trainer.current_epoch}: Aggregated Val Recall@TopK already recorded with same value {val_metric:.4f}.")
+                    debug_print(f"Epoch {trainer.current_epoch}: Val Recall@TopK already recorded with same value {val_metric:.4f}.")
         else:
-            debug_print(f"Warning: No validation metric found in callback_metrics or logged_metrics")
+            debug_print(f"Warning: No validation metric found in callback_metrics at Validation End")
     
     def plot_metrics(self, save_path=None):
         """绘制训练损失和验证指标曲线"""

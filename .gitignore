@@ -1,0 +1,4 @@
+# 忽略 Python 字节码缓存
+*.pyc
+__pycache__/
+
