@@ -32,7 +32,8 @@ from ptls.preprocessing import (
 
 from encode_3 import UniversalFeatureEncoder
 from config import init_config
-from train_coles import load_jsonl_as_dataframe_new_format
+# from train_coles import load_jsonl_as_dataframe_new_format
+from data_load_xqy import load_jsonl_as_dataframe_new_format
 
 
 
@@ -210,7 +211,7 @@ class MetricsTracker(Callback):
         
         # 尝试多种可能的验证指标键名（recall@top_k）
         val_metric = None
-        for key in ['valid/recall_top_k', 'valid/BatchRecallTopK', 'val_recall_top_k', 'recall_top_k']:
+        for key in ['valid/recall_top_k']:
             if key in trainer.callback_metrics:
                 val_metric = trainer.callback_metrics[key].item()
                 debug_print(f"Found aggregated validation metric with key '{key}' from callback_metrics: {val_metric:.4f}")
@@ -718,9 +719,10 @@ def train_incremental_coles_universal(train_dir, val_dir, config, checkpoint_dir
             source_data_train = load_jsonl_as_dataframe_new_format(train_file)
             train_data = preprocessor.fit_transform(source_data_train)
             
+            
             # 记录数据加载完成时间
             print_time_point(f"文件 {os.path.basename(train_file)} 加载和预处理完成", data_load_start_time)
-            
+
             # 创建数据模块
             datamodule = PtlsDataModule(
                 train_data=ColesDataset(

@@ -5,6 +5,7 @@ import time
 import glob
 from datetime import datetime
 from functools import partial
+from tqdm import tqdm
 
 import pandas as pd
 import torch
@@ -22,6 +23,7 @@ from ptls.frames.coles import CoLESModule, ColesDataset
 from ptls.frames.coles.split_strategy import SampleSlices
 from ptls.data_load.datasets import MemoryMapDataset
 from ptls.data_load.iterable_processing import SeqLenFilter
+from ptls.data_load.padded_batch import PaddedBatch
 from ptls.preprocessing import (
     PandasDataPreprocessor, 
     extract_predefined_mappings_from_feature_config, 
@@ -30,11 +32,12 @@ from ptls.preprocessing import (
 
 from encode_3 import UniversalFeatureEncoder
 from config import init_config
-from train_coles import load_jsonl_as_dataframe_new_format
+# from train_coles import load_jsonl_as_dataframe_new_format
+from data_load_xqy import load_jsonl_as_dataframe_new_format
 
 
 
-
+os.environ['OMP_NUM_THREADS'] = '1'
 
 # 设置日志文件，将调试信息重定向到文件（只在主进程中执行）
 @rank_zero_only
@@ -148,29 +151,29 @@ class MetricsTracker(Callback):
         
         # 调试：打印所有可用的指标键
         debug_print(f"\n=== Epoch {trainer.current_epoch} Train End ===")
-        debug_print(f"Available logged_metrics keys: {list(trainer.logged_metrics.keys())}")
-        debug_print(f"All logged_metrics: {trainer.logged_metrics}")
+        debug_print(f"Available callback_metrics keys: {list(trainer.callback_metrics.keys())}")
+        debug_print(f"All callback_metrics: {trainer.callback_metrics}")
         
         # 尝试多种可能的训练损失键名
         train_loss = None
         for key in ['train_loss', 'loss', 'train/loss']:
-            if key in trainer.logged_metrics:
-                train_loss = trainer.logged_metrics[key].item()
-                debug_print(f"Found train loss with key '{key}': {train_loss:.4f}")
+            if key in trainer.callback_metrics:
+                train_loss = trainer.callback_metrics[key].item()
+                debug_print(f"Found aggregated train loss with key '{key}' from callback_metrics: {train_loss:.4f}")
                 break
         
         if train_loss is not None:
             self.train_losses.append(train_loss)
             debug_print(f"Epoch {trainer.current_epoch}: Train Loss = {train_loss:.4f}")
         else:
-            debug_print(f"Warning: No train loss found in logged_metrics")
+            debug_print(f"Warning: No train loss found in callback_metrics")
             
         # 在训练 epoch 结束时也尝试记录验证指标
         val_metric = None
         for key in ['valid/recall_top_k', 'valid/BatchRecallTopK', 'val_recall_top_k', 'recall_top_k']:
-            if key in trainer.logged_metrics:
-                val_metric = trainer.logged_metrics[key].item()
-                debug_print(f"Found validation metric with key '{key}' at Train End: {val_metric:.4f}")
+            if key in trainer.callback_metrics:
+                val_metric = trainer.callback_metrics[key].item()
+                debug_print(f"Found aggregated validation metric with key '{key}' from callback_metrics: {val_metric:.4f}")
                 break
         
         if val_metric is not None:
@@ -189,7 +192,7 @@ class MetricsTracker(Callback):
                 else:
                     debug_print(f"Epoch {trainer.current_epoch}: Val Recall@TopK already recorded with same value {val_metric:.4f}.")
         else:
-            debug_print(f"Warning: No validation metric found in logged_metrics at Train End")
+            debug_print(f"Warning: No validation metric found in callback_metrics at Train End")
     
     def on_validation_epoch_start(self, trainer, pl_module):
         """验证epoch开始时记录时间"""
@@ -203,15 +206,15 @@ class MetricsTracker(Callback):
         
         # 调试：打印所有可用的指标键
         debug_print(f"\n=== Epoch {trainer.current_epoch} Validation End ===")
-        debug_print(f"Available logged_metrics keys: {list(trainer.logged_metrics.keys())}")
-        debug_print(f"All logged_metrics: {trainer.logged_metrics}")
+        debug_print(f"Available callback_metrics keys: {list(trainer.callback_metrics.keys())}")
+        debug_print(f"All callback_metrics: {trainer.callback_metrics}")
         
         # 尝试多种可能的验证指标键名（recall@top_k）
         val_metric = None
-        for key in ['valid/recall_top_k', 'valid/BatchRecallTopK', 'val_recall_top_k', 'recall_top_k']:
-            if key in trainer.logged_metrics:
-                val_metric = trainer.logged_metrics[key].item()
-                debug_print(f"Found validation metric with key '{key}' at Validation End: {val_metric:.4f}")
+        for key in ['valid/recall_top_k']:
+            if key in trainer.callback_metrics:
+                val_metric = trainer.callback_metrics[key].item()
+                debug_print(f"Found aggregated validation metric with key '{key}' from callback_metrics: {val_metric:.4f}")
                 break
         
         if val_metric is not None:
@@ -230,7 +233,7 @@ class MetricsTracker(Callback):
                 else:
                     debug_print(f"Epoch {trainer.current_epoch}: Val Recall@TopK already recorded with same value {val_metric:.4f}.")
         else:
-            debug_print(f"Warning: No validation metric found in logged_metrics at Validation End")
+            debug_print(f"Warning: No validation metric found in callback_metrics at Validation End")
     
     def plot_metrics(self, save_path=None):
         """绘制训练损失和验证指标曲线"""
@@ -239,7 +242,19 @@ class MetricsTracker(Callback):
         # 创建两个子图
         plt.subplot(2, 1, 1)
         if self.train_losses:
-            plt.plot(range(len(self.train_losses)), self.train_losses, 'b-', label='Training Loss', linewidth=2)
+            epochs_range = range(len(self.train_losses))
+            plt.plot(epochs_range, self.train_losses, 'b-', label='Training Loss', linewidth=2, marker='o')
+            
+            # 为每个训练损失数据点添加数值标注
+            for i, (epoch, loss) in enumerate(zip(epochs_range, self.train_losses)):
+                plt.annotate(f'{loss:.4f}', 
+                            xy=(epoch, loss), 
+                            xytext=(0, 10),  # 向上偏移10个像素
+                            textcoords='offset points',
+                            ha='center', va='bottom',
+                            fontsize=9,
+                            bbox=dict(boxstyle='round,pad=0.2', facecolor='lightblue', alpha=0.7))
+                            
         plt.title('Training Loss', fontsize=14, fontweight='bold')
         plt.xlabel('Epoch')
         plt.ylabel('Loss')
@@ -255,6 +270,17 @@ class MetricsTracker(Callback):
             sorted_val_metrics = [self.val_metrics[i] for i in sorted_indices]
 
             plt.plot(sorted_epochs, sorted_val_metrics, 'g-', label='Validation Recall@TopK', linewidth=2, marker='o')
+            
+            # 为每个验证指标数据点添加数值标注
+            for epoch, metric in zip(sorted_epochs, sorted_val_metrics):
+                plt.annotate(f'{metric:.4f}', 
+                            xy=(epoch, metric), 
+                            xytext=(0, 10),  # 向上偏移10个像素
+                            textcoords='offset points',
+                            ha='center', va='bottom',
+                            fontsize=9,
+                            bbox=dict(boxstyle='round,pad=0.2', facecolor='lightgreen', alpha=0.7))
+                            
             plt.title('Validation Recall@TopK', fontsize=14, fontweight='bold')
             plt.xlabel('Epoch')
             plt.ylabel('Recall@TopK')
@@ -270,7 +296,7 @@ class MetricsTracker(Callback):
                             xytext=(max_epoch + len(sorted_epochs)*0.1, max_val_metric - (max(sorted_val_metrics) - min(sorted_val_metrics))*0.1),
                             arrowprops=dict(arrowstyle='->', color='green', alpha=0.7),
                             fontsize=10, 
-                            bbox=dict(boxstyle='round,pad=0.3', facecolor='lightgreen', alpha=0.7))
+                            bbox=dict(boxstyle='round,pad=0.3', facecolor='yellow', alpha=0.8))
         
         plt.tight_layout()
         
@@ -433,7 +459,6 @@ class UniversalTrxEncoder(nn.Module):
         
         # 5: 重新包装为PaddedBatch格式
         # 保持原有的序列长度信息，确保与后续的序列编码器兼容
-        from ptls.data_load.padded_batch import PaddedBatch
         new_x = PaddedBatch(encoded, x.seq_lens)
         
         debug_print(f"Encoded tensor shape: {encoded.shape}")
@@ -514,7 +539,7 @@ def train_incremental_coles_universal(train_dir, val_dir, config, checkpoint_dir
     # 记录函数开始时间
     function_start_time = print_time_point("=== 增量训练函数开始 ===")
     
-    import glob
+
     output_dir = './output'                   #保存图像结果
     os.makedirs(output_dir, exist_ok=True)
     os.makedirs(checkpoint_dir, exist_ok=True)
@@ -649,6 +674,8 @@ def train_incremental_coles_universal(train_dir, val_dir, config, checkpoint_dir
     # 记录整体训练开始时间
     overall_training_start_time = print_time_point("=== 开始整体训练过程 ===")
     
+
+    
     # 按epoch遍历训练
     for epoch in range(epochs):
         # 记录当前epoch开始时间
@@ -662,7 +689,27 @@ def train_incremental_coles_universal(train_dir, val_dir, config, checkpoint_dir
         max_files_per_epoch = 50  # 设置最大处理文件数，比如只处理前50个文件
         files_to_process = min(len(train_files), max_files_per_epoch)
         
-        for file_idx, train_file in enumerate(train_files[:files_to_process]):
+        # 使用tqdm显示epoch级别的进度条
+        epoch_desc = f"Epoch {epoch + 1}/{epochs}"
+        file_pbar = tqdm(train_files[:files_to_process], 
+                        desc=epoch_desc,
+                        unit="file",
+                        ncols=120,
+                        file=sys.stdout,
+                        leave=True)
+        
+        for file_idx, train_file in enumerate(file_pbar):
+            # 更新进度条描述，显示当前文件名和指标
+            current_file = os.path.basename(train_file)
+            avg_loss = sum(epoch_train_losses) / len(epoch_train_losses) if epoch_train_losses else 0.0
+            avg_val = sum(epoch_val_metrics) / len(epoch_val_metrics) if epoch_val_metrics else 0.0
+            
+            file_pbar.set_postfix({
+                'file': current_file[:20] + '...' if len(current_file) > 20 else current_file,
+                'avg_loss': f'{avg_loss:.4f}' if avg_loss > 0 else 'N/A',
+                'avg_val': f'{avg_val:.4f}' if avg_val > 0 else 'N/A'
+            })
+            
             file_start_time = print_time_point(f"Epoch {epoch + 1}, 开始处理文件 {file_idx + 1}/{files_to_process}: {os.path.basename(train_file)}")
             
             # 加载和预处理当前训练文件
@@ -672,9 +719,10 @@ def train_incremental_coles_universal(train_dir, val_dir, config, checkpoint_dir
             source_data_train = load_jsonl_as_dataframe_new_format(train_file)
             train_data = preprocessor.fit_transform(source_data_train)
             
+            
             # 记录数据加载完成时间
             print_time_point(f"文件 {os.path.basename(train_file)} 加载和预处理完成", data_load_start_time)
-            
+
             # 创建数据模块
             datamodule = PtlsDataModule(
                 train_data=ColesDataset(
@@ -689,7 +737,6 @@ def train_incremental_coles_universal(train_dir, val_dir, config, checkpoint_dir
                         cnt_max=5,
                     ),
                 ),
-                train_batch_size=batch_size,
                 valid_data=ColesDataset(
                     MemoryMapDataset(
                     # MemoryIterableDataset(
@@ -702,7 +749,10 @@ def train_incremental_coles_universal(train_dir, val_dir, config, checkpoint_dir
                         cnt_max=5,
                     ),
                 ),
+                train_batch_size=batch_size,
+                train_num_workers=2,
                 valid_batch_size=batch_size,
+                valid_num_workers=2,
             )
             
             # 创建文件级指标跟踪器
@@ -713,16 +763,27 @@ def train_incremental_coles_universal(train_dir, val_dir, config, checkpoint_dir
             # 添加分布式训练调试信息
             _log_distributed_info()
             
+            # 动态控制模型摘要显示：只在第一次创建Trainer时显示
+            global _first_trainer_created
+            enable_summary = not _first_trainer_created
+            if not _first_trainer_created:
+                _first_trainer_created = True
+                debug_print("首次创建Trainer，启用模型摘要显示")
+            else:
+                debug_print("非首次创建Trainer，禁用模型摘要显示")
+            
             trainer = pl.Trainer(
-                max_epochs=2,
+                max_epochs=1,
                 accelerator='gpu' if torch.cuda.is_available() else 'cpu',
                 strategy='ddp',
                 devices=2 if torch.cuda.is_available() else 'auto',
-                enable_progress_bar=True,
+                enable_progress_bar=False,             # 禁用trainer内置进度条，使用我们自定义的tqdm进度条
                 callbacks=[file_metrics_tracker],
                 enable_checkpointing=False,
                 check_val_every_n_epoch=1,
                 val_check_interval=1.0,
+                logger=False,                         # 禁用默认logger输出
+                enable_model_summary=enable_summary,  # 动态控制模型参数统计信息的自动输出
             )
             
             # 添加优化器调试信息
@@ -783,6 +844,18 @@ def train_incremental_coles_universal(train_dir, val_dir, config, checkpoint_dir
             if file_metrics_tracker.val_metrics:
                 epoch_val_metrics.extend(file_metrics_tracker.val_metrics)
             
+            # 更新tqdm进度条显示最新指标
+            current_file = os.path.basename(train_file)
+            avg_loss = sum(epoch_train_losses) / len(epoch_train_losses) if epoch_train_losses else 0.0
+            avg_val = sum(epoch_val_metrics) / len(epoch_val_metrics) if epoch_val_metrics else 0.0
+            
+            file_pbar.set_postfix({
+                'file': current_file[:20] + '...' if len(current_file) > 20 else current_file,
+                'avg_loss': f'{avg_loss:.4f}' if avg_loss > 0 else 'N/A',
+                'avg_val': f'{avg_val:.4f}' if avg_val > 0 else 'N/A',
+                'status': 'completed'
+            })
+            
             # 释放内存
             del source_data_train, train_data, datamodule
             torch.cuda.empty_cache() if torch.cuda.is_available() else None
@@ -805,6 +878,17 @@ def train_incremental_coles_universal(train_dir, val_dir, config, checkpoint_dir
             debug_print(f"Epoch {epoch + 1} 平均验证指标: {avg_val_metric:.4f}")
         
         all_epochs.append(epoch)
+        
+        # 关闭当前epoch的进度条
+        file_pbar.close()
+        
+        # 显示epoch完成总结
+        final_avg_loss = sum(epoch_train_losses) / len(epoch_train_losses) if epoch_train_losses else 0.0
+        final_avg_val = sum(epoch_val_metrics) / len(epoch_val_metrics) if epoch_val_metrics else 0.0
+        print(f"\n✓ Epoch {epoch + 1}/{epochs} 完成 - 处理了 {files_to_process} 个文件")
+        print(f"  最终平均损失: {final_avg_loss:.4f}")
+        print(f"  最终平均验证指标: {final_avg_val:.4f}")
+        print("-" * 80)
         
         # 记录当前epoch完成时间
         print_time_point(f"第 {epoch + 1}/{epochs} 个Epoch 完成", epoch_start_time)
@@ -887,6 +971,9 @@ def _log_distributed_info():
         debug_print(f"当前CUDA设备: {current_device}")
         debug_print(f"设备名称: {torch.cuda.get_device_name(current_device)}")
     debug_print(f"=== 训练前环境信息结束 ===\n")
+
+# 全局标志，用于控制PyTorch Lightning模型摘要只在第一次显示
+_first_trainer_created = False
 
 def _log_optimizer_info(model, train_file):
     """记录优化器状态调试信息"""
@@ -1027,7 +1114,7 @@ def _log_data_info(datamodule, train_data, valid_data, batch_size):
     debug_print(f"=== 数据加载调试信息结束 ===\n")
 
 def print_with_rank(*args, **kwargs):
-    """带进程信息的打印函数，所有进程都会输出"""
+    """带进程信息的打印函数，根据进程信息输出到不同的日志文件"""
     rank = int(os.environ.get('RANK', 0))
     local_rank = int(os.environ.get('LOCAL_RANK', 0))
     world_size = int(os.environ.get('WORLD_SIZE', 1))
@@ -1036,7 +1123,26 @@ def print_with_rank(*args, **kwargs):
     # 格式化消息，添加进程信息前缀
     message = ' '.join(str(arg) for arg in args)
     formatted_message = f"[Rank {rank}/{world_size}, Local Rank {local_rank}, PID {pid}] {message}"
-    print(formatted_message, **kwargs)
+    
+    # 根据进程信息创建日志文件名
+    log_filename = f"process_rank_{rank}_local_{local_rank}_pid_{pid}.log"
+    log_path = os.path.join("./logs_xqy", log_filename)
+    
+    # 确保日志目录存在
+    os.makedirs("./logs_xqy", exist_ok=True)
+    
+    # 获取当前时间戳
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+    
+    # 写入日志文件
+    try:
+        with open(log_path, 'a', encoding='utf-8') as f:
+            f.write(f"[{timestamp}] {formatted_message}\n")
+            f.flush()  # 确保立即写入
+    except Exception as e:
+        # 如果写入文件失败，回退到终端输出
+        print(f"日志写入失败: {e}")
+        print(formatted_message, **kwargs)
 
 @rank_zero_only
 def print_main_only(*args, **kwargs):
