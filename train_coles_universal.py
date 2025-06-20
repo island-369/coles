@@ -34,6 +34,10 @@ from encode_3 import UniversalFeatureEncoder
 from config import init_config
 # from train_coles import load_jsonl_as_dataframe_new_format
 from data_load_xqy import load_jsonl_as_dataframe_new_format, MultiFileColesIterableDataset, StreamingUserColesIterableDataset
+from pytorch_lightning.profilers import PyTorchProfiler
+import torch.profiler
+
+
 
 
 
@@ -694,6 +698,24 @@ def train_continuous_coles_universal(train_dir, val_dir, config):
     # 创建指标跟踪器
     metrics_tracker = MetricsTracker()
     
+    # 配置性能监控器
+    debug_print("\n=== 配置性能监控器 ===")
+    is_dist = torch.distributed.is_initialized()
+    should_profile = (not is_dist) or (torch.distributed.get_rank() == 0)
+    
+    if should_profile:
+        debug_print("启用性能监控 - 当前进程将进行性能分析")
+        profiler = PyTorchProfiler(
+            on_trace_ready=torch.profiler.tensorboard_trace_handler('./logs/torch_prof_lightning'),
+            profile_memory=True,
+            record_shapes=True,
+            with_stack=True,
+            schedule=None,
+        )
+    else:
+        debug_print("跳过性能监控 - 非主进程或非分布式环境")
+        profiler = None
+    
     # 创建Trainer（只创建一次）
     debug_print("\n=== 创建Trainer（只创建一次）===")
     trainer = pl.Trainer(
@@ -708,6 +730,7 @@ def train_continuous_coles_universal(train_dir, val_dir, config):
         val_check_interval=1.0,
         logger=False,
         enable_model_summary=True,
+        profiler=profiler,
     )
     
     # 开始训练（一次性训练所有epochs）
@@ -754,6 +777,16 @@ def train_continuous_coles_universal(train_dir, val_dir, config):
     with open(metrics_save_path, 'w', encoding='utf-8') as f:
         json.dump(metrics_data, f, indent=2, ensure_ascii=False)
     debug_print(f"训练指标已保存到: {metrics_save_path}")
+    
+    # 性能监控结果说明
+    if should_profile and profiler is not None:
+        debug_print("\n=== 性能监控结果 ===")
+        debug_print("性能分析数据已保存到: ./logs/torch_prof_lightning/")
+        debug_print("查看性能分析结果的方法:")
+        debug_print("1. 启动TensorBoard: tensorboard --logdir=./logs/torch_prof_lightning")
+        debug_print("2. 在浏览器中打开: http://localhost:6006")
+        debug_print("3. 点击 'PROFILE' 标签页查看性能分析")
+        debug_print("4. 可以查看CPU/GPU使用率、内存使用、算子耗时等详细信息")
     
     print_time_point("连续训练函数完成", function_start_time)
     
