@@ -33,7 +33,7 @@ from ptls.preprocessing import (
 from encode_3 import UniversalFeatureEncoder
 from config import init_config
 # from train_coles import load_jsonl_as_dataframe_new_format
-from data_load_xqy import load_jsonl_as_dataframe_new_format
+from data_load_xqy import load_jsonl_as_dataframe_new_format, MultiFileColesIterableDataset
 
 
 
@@ -526,6 +526,245 @@ def create_feature_config_for_universal_encoder(config_path='feature_config.json
     
     # print("create_feature_config_for_universal_encoder:",feature_config)
     return feature_config
+
+
+def train_continuous_coles_universal(train_dir, val_dir, config):
+    """使用MultiFileColesIterableDataset进行连续训练的CoLES模型
+    
+    这个函数将多个训练文件整合成一个连续的数据流，只创建一次Trainer进行训练。
+    相比逐文件训练，这种方式可以保持参数状态的连续性，避免重复创建Trainer的开销。
+    
+    Args:
+        train_dir (str): 训练文件目录
+        val_dir (str): 验证文件目录  
+        config (dict): 配置字典
+    
+    Returns:
+        tuple: (model, metrics_tracker)
+    """
+    # 记录函数开始时间
+    function_start_time = print_time_point("=== 连续训练函数开始 ===")
+    
+    output_dir = './output'
+    os.makedirs(output_dir, exist_ok=True)
+    
+    # 解析配置
+    model_config = config['model_config']
+    data_config = config['data_config']
+    train_config = config['train_config']
+    feature_config = config['feature_config']
+    
+    batch_size = train_config['batch_size']
+    epochs = train_config['epochs']
+    learning_rate = train_config['learning_rate']
+    model_dim = model_config['model_dim']
+    n_heads = model_config['n_heads']
+    n_layers = model_config['n_layers']
+    feature_fusion = model_config.get('feature_fusion', 'concat')
+    
+    # 从配置文件中读取嵌入维度配置和数值特征配置
+    emb_dim_cfg = config.get('universal_encoder_config', {}).get('emb_dim_cfg', {})
+    num_fbr_cfg = config.get('universal_encoder_config', {}).get('num_fbr_cfg', {})
+    
+    if not emb_dim_cfg:
+        debug_print("no emb_dim_cfg")
+    else:
+        debug_print("emb_dim_cfg", emb_dim_cfg)
+        
+    if not num_fbr_cfg:
+        debug_print("no num_fbr_cfg")
+    else:
+        debug_print("num_fbr_cfg", num_fbr_cfg)
+    
+    # 记录文件扫描开始时间
+    file_scan_start_time = print_time_point("开始扫描训练和验证文件")
+    
+    # 获取训练和验证文件列表
+    train_files = sorted(glob.glob(os.path.join(train_dir, "*.jsonl")))
+    val_files = sorted(glob.glob(os.path.join(val_dir, "*.jsonl")))
+    
+    if not train_files:
+        raise ValueError(f"在目录 {train_dir} 中没有找到任何jsonl文件")
+    else:
+        debug_print(f"找到 {len(train_files)} 个训练文件: {[os.path.basename(f) for f in train_files]}")
+    if not val_files:
+        raise ValueError(f"在目录 {val_dir} 中没有找到任何jsonl文件")
+    else:
+        debug_print(f"找到 {len(val_files)} 个验证文件: {[os.path.basename(f) for f in val_files]}")
+    
+    print_time_point("文件扫描完成", file_scan_start_time)
+    
+    # 记录预处理器创建开始时间
+    preprocessor_start_time = print_time_point("开始创建数据预处理器")
+    
+    # 从feature_config中提取预定义映射
+    predefined_mappings = extract_predefined_mappings_from_feature_config(feature_config)
+    categorical_columns = get_categorical_columns_from_feature_config(feature_config)
+    
+    # 创建数据预处理器
+    preprocessor = PandasDataPreprocessor(
+        col_id='client_id',
+        col_event_time='unix_timestamp',
+        event_time_transformation='none',
+        cols_category=categorical_columns,
+        cols_category_with_mapping=predefined_mappings,
+        cols_numerical=['交易金额'],
+        return_records=True
+    )
+    
+    print_time_point("数据预处理器创建完成", preprocessor_start_time)
+    
+    # 创建验证数据的流式加载（与训练数据保持一致）
+    val_load_start_time = print_time_point("开始创建验证数据流")
+    
+    debug_print(f"验证文件列表: {[os.path.basename(f) for f in val_files]}")
+    print_time_point("验证数据流创建完成", val_load_start_time)
+    
+    # 创建模型
+    model_creation_start_time = print_time_point("开始创建模型")
+    
+    # 创建交易编码器
+    trx_encoder = UniversalTrxEncoder(
+        feature_config=feature_config,
+        emb_dim_cfg=emb_dim_cfg,
+        num_fbr_cfg=num_fbr_cfg,
+        feature_fusion=feature_fusion,
+        embeddings_noise=0.003,
+        linear_projection_size=model_dim
+    )
+    
+    # 创建序列编码器
+    seq_encoder = TransformerSeqEncoder(
+        trx_encoder=trx_encoder,
+        input_size=None,
+        is_reduce_sequence=True,
+        n_heads=n_heads,
+        n_layers=n_layers,
+        dropout=0.1,
+        dim_hidden=model_dim*4
+    )
+    
+    # 创建CoLES模型
+    model = CoLESModule(
+        seq_encoder=seq_encoder,
+        optimizer_partial=partial(torch.optim.Adam, lr=learning_rate),
+        lr_scheduler_partial=partial(
+            torch.optim.lr_scheduler.StepLR, step_size=30, gamma=0.9
+        )
+    )
+    
+    print_time_point("模型创建完成", model_creation_start_time)
+    
+    # 定义数据集构建函数
+    def build_dataset_from_df(processed_df):
+        """从预处理后的DataFrame构建ColesDataset"""
+        return ColesDataset(
+            MemoryMapDataset(
+                data=processed_df,
+                i_filters=[SeqLenFilter(min_seq_len=1)],
+            ),
+            splitter=SampleSlices(
+                split_count=5,
+                cnt_min=1,
+                cnt_max=5,
+            ),
+        )
+    
+    # 创建训练数据的多文件可迭代数据集
+    debug_print("\n=== 创建训练数据MultiFileColesIterableDataset ===")
+    train_iterable_dataset = MultiFileColesIterableDataset(
+        file_paths=train_files,
+        preprocessor=preprocessor,
+        dataset_builder=build_dataset_from_df,
+        debug_print_func=debug_print
+    )
+    
+    # 创建验证数据的多文件可迭代数据集（流式加载）
+    debug_print("\n=== 创建验证数据MultiFileColesIterableDataset ===")
+    valid_iterable_dataset = MultiFileColesIterableDataset(
+        file_paths=val_files,
+        preprocessor=preprocessor,
+        dataset_builder=build_dataset_from_df,
+        debug_print_func=debug_print
+    )
+    
+    # 创建数据模块（训练和验证都使用流式数据集）
+    datamodule = PtlsDataModule(
+        train_data=train_iterable_dataset,
+        valid_data=valid_iterable_dataset,
+        train_batch_size=batch_size,
+        train_num_workers=2,
+        valid_batch_size=batch_size,
+        valid_num_workers=2,
+    )
+    
+    # 创建指标跟踪器
+    metrics_tracker = MetricsTracker()
+    
+    # 创建Trainer（只创建一次）
+    debug_print("\n=== 创建Trainer（只创建一次）===")
+    trainer = pl.Trainer(
+        max_epochs=epochs,
+        accelerator='gpu' if torch.cuda.is_available() else 'cpu',
+        strategy='ddp',
+        devices=2 if torch.cuda.is_available() else 'auto',
+        enable_progress_bar=True,
+        callbacks=[metrics_tracker],
+        enable_checkpointing=True,
+        check_val_every_n_epoch=1,
+        val_check_interval=1.0,
+        logger=False,
+        enable_model_summary=True,
+    )
+    
+    # 开始训练（一次性训练所有epochs）
+    training_start_time = print_time_point("=== 开始连续训练 ===")
+    debug_print(f"训练配置: {epochs} epochs, batch_size={batch_size}, lr={learning_rate}")
+    debug_print(f"训练文件数: {len(train_files)}")
+    debug_print(f"验证文件数: {len(val_files)}")
+
+    
+    trainer.fit(model, datamodule)
+    
+    print_time_point("连续训练完成", training_start_time)
+    
+    # 保存训练结果
+    debug_print("\n=== 保存训练结果 ===")
+    
+    # 保存模型
+    model_save_path = os.path.join(output_dir, 'continuous_coles_model.ckpt')
+    trainer.save_checkpoint(model_save_path)
+    debug_print(f"模型已保存到: {model_save_path}")
+    
+    # 绘制和保存指标图表
+    plot_save_path = os.path.join(output_dir, 'continuous_training_metrics.png')
+    metrics_tracker.plot_metrics(save_path=plot_save_path)
+    
+    # 保存指标数据
+    metrics_data = {
+        'train_losses': metrics_tracker.train_losses,
+        'val_metrics': metrics_tracker.val_metrics,
+        'epochs': metrics_tracker.epochs,
+        'training_config': {
+            'epochs': epochs,
+            'batch_size': batch_size,
+            'learning_rate': learning_rate,
+            'model_dim': model_dim,
+            'n_heads': n_heads,
+            'n_layers': n_layers,
+            'train_files_count': len(train_files),
+            'val_files_count': len(val_files)
+        }
+    }
+    
+    metrics_save_path = os.path.join(output_dir, 'continuous_training_metrics.json')
+    with open(metrics_save_path, 'w', encoding='utf-8') as f:
+        json.dump(metrics_data, f, indent=2, ensure_ascii=False)
+    debug_print(f"训练指标已保存到: {metrics_save_path}")
+    
+    print_time_point("连续训练函数完成", function_start_time)
+    
+    return model, metrics_tracker
 
 
 def train_incremental_coles_universal(train_dir, val_dir, config, checkpoint_dir='./checkpoints'):
@@ -1173,7 +1412,37 @@ if __name__ == '__main__':
         train_path = 'test_directory/train'  # 训练数据目录
         val_path = 'test_directory/val'      # 验证数据目录
         
-        if INCREMENTAL_MODE:
+        # 训练模式选择
+        # INCREMENTAL_MODE = True: 逐文件训练（原有模式）
+        # INCREMENTAL_MODE = False: 普通训练模式
+        # CONTINUOUS_MODE = True: 连续训练模式（新增，使用MultiFileColesIterableDataset）
+        CONTINUOUS_MODE = True  # 新增的连续训练模式
+        
+        if CONTINUOUS_MODE:
+            debug_print("\n=== 启用连续训练模式 ===")
+            debug_print("使用MultiFileColesIterableDataset将多个文件整合为连续数据流，只创建一次Trainer")
+            
+            # 记录连续训练模式开始时间
+            continuous_mode_start_time = print_time_point("连续训练模式开始")
+            
+            model, metrics_tracker = train_continuous_coles_universal(
+                train_dir=train_path,
+                val_dir=val_path,
+                config=config
+            )
+            
+            # 记录连续训练模式完成时间
+            print_time_point("连续训练模式完成", continuous_mode_start_time)
+            
+            debug_print(f"\n=== 连续训练总结 ===")
+            debug_print(f"训练完成时间: {datetime.now()}")
+            debug_print(f"总训练epoch数: {config['train_config']['epochs']}")
+            if metrics_tracker.val_metrics:
+                best_val_metric = max(metrics_tracker.val_metrics)
+                debug_print(f"最佳验证指标: {best_val_metric:.4f}")
+            debug_print(f"所有输出文件保存在: ./output/ 目录")
+            
+        elif INCREMENTAL_MODE:
             debug_print("\n=== 启用增量训练模式 ===")
             debug_print("将逐个文件进行训练，每个文件训练完成后保存检查点")
             

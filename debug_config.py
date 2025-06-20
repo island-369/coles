@@ -14,7 +14,7 @@ ENABLE_PERFORMANCE_MONITORING = True
 
 # 输出格式设置
 MAX_TENSOR_ELEMENTS = 3  # 张量显示的最大元素数
-MAX_DICT_FIELDS = 6      # 字典显示的最大字段数
+MAX_DICT_FIELDS =22      # 字典显示的最大字段数
 MAX_LIST_ELEMENTS = 5    # 列表显示的最大元素数
 
 # 特定组件的调试控制

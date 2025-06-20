@@ -1,9 +1,310 @@
 import json
 import os
 import glob
+import json
 import pandas as pd
 from pytorch_lightning.utilities.rank_zero import rank_zero_only
 import ptls
+
+
+from torch.utils.data import IterableDataset, get_worker_info
+import torch
+import os
+from pytorch_lightning.utilities.rank_zero import rank_zero_only
+
+class MultiFileColesIterableDataset(IterableDataset):
+    """改进的多文件可迭代数据集，支持分布式训练和连续数据流
+    
+    这个数据集将多个训练文件整合成一个连续的数据流，避免了重复创建Trainer的开销。
+    支持分布式训练，每个进程处理不同的文件子集。
+    """
+    
+    def __init__(self, file_paths, preprocessor, dataset_builder, debug_print_func=None):
+        """
+        Args:
+            file_paths: 训练文件路径列表
+            preprocessor: 数据预处理器
+            dataset_builder: 数据集构建函数，接收处理后的DataFrame，返回Dataset
+            debug_print_func: 调试打印函数
+        """
+        self.file_paths = file_paths
+        self.preprocessor = preprocessor
+        self.dataset_builder = dataset_builder
+        self.debug_print = debug_print_func if debug_print_func else print
+        
+        # 记录数据集信息
+        self._log_dataset_info()
+    
+    @staticmethod
+    def collate_fn(batch):
+        """批处理函数，与ColesDataset保持一致"""
+        from operator import iadd
+        from functools import reduce
+        from ptls.data_load.utils import collate_feature_dict
+        import torch
+        
+        class_labels = [i for i, class_samples in enumerate(batch) for _ in class_samples]
+        batch = reduce(iadd, batch)
+        padded_batch = collate_feature_dict(batch)
+        return padded_batch, torch.LongTensor(class_labels)
+    
+    @rank_zero_only
+    def _log_dataset_info(self):
+        """记录数据集基本信息"""
+        self.debug_print(f"\n=== MultiFileColesIterableDataset 初始化 ===")
+        self.debug_print(f"总文件数: {len(self.file_paths)}")
+        self.debug_print(f"文件列表: {[os.path.basename(f) for f in self.file_paths[:5]]}{'...' if len(self.file_paths) > 5 else ''}")
+        self.debug_print(f"=== 数据集初始化完成 ===\n")
+    
+    def __iter__(self):
+        """迭代器实现，支持分布式训练"""
+        # 获取分布式训练信息
+        rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+        world_size = torch.distributed.get_world_size() if torch.distributed.is_initialized() else 1
+        
+        # 处理文件数量少于进程数的情况：循环分配文件
+        if len(self.file_paths) < world_size:
+            # 通过循环索引确保每个进程都能分配到文件
+            extended_files = []
+            for i in range(world_size):
+                file_idx = i % len(self.file_paths)
+                extended_files.append(self.file_paths[file_idx])
+            file_list = extended_files
+        else:
+            file_list = self.file_paths
+        
+        # 获取worker信息（用于DataLoader多进程）
+        worker_info = get_worker_info()
+        if worker_info is not None:
+            # 在DataLoader多进程环境中
+            worker_id = worker_info.id
+            num_workers = worker_info.num_workers
+            
+            # 先按DDP进程分片，再按worker分片
+            files_per_rank = file_list[rank::world_size]
+            assigned_files = files_per_rank[worker_id::num_workers]
+            
+            self.debug_print(f"Worker {worker_id}/{num_workers} on rank {rank}/{world_size} processing {len(assigned_files)} files")
+        else:
+            # 单进程环境，只按DDP分片
+            assigned_files = file_list[rank::world_size]
+            self.debug_print(f"Rank {rank}/{world_size} processing {len(assigned_files)} files")
+        
+        # 如果当前进程仍然没有分配到文件，记录警告但不阻塞
+        if len(assigned_files) == 0:
+            self.debug_print(f"警告: Rank {rank} 没有分配到文件，将跳过训练")
+            return
+        
+        # 逐文件处理并生成样本
+        for file_idx, file_path in enumerate(assigned_files):
+            try:
+                self.debug_print(f"开始处理文件 {file_idx + 1}/{len(assigned_files)}: {os.path.basename(file_path)}")
+                
+                # 加载和预处理数据
+                df = load_jsonl_as_dataframe_new_format(file_path)
+                processed_data = self.preprocessor.fit_transform(df)
+                
+                # 构建数据集
+                dataset = self.dataset_builder(processed_data)
+                
+                # 生成样本
+                sample_count = 0
+                for sample in dataset:
+                    yield sample
+                    sample_count += 1
+                
+                self.debug_print(f"文件 {os.path.basename(file_path)} 处理完成，生成 {sample_count} 个样本")
+                
+            except Exception as e:
+                self.debug_print(f"处理文件 {file_path} 时出错: {str(e)}")
+                # 继续处理下一个文件，不中断整个训练过程
+                continue
+
+
+class StreamingUserColesIterableDataset(IterableDataset):
+    """流式用户级数据集，逐行读取用户数据并进行预处理
+    
+    相比MultiFileColesIterableDataset的文件级读取，这个类实现用户级流式读取：
+    - 逐行读取jsonl文件，每行是一个用户的数据
+    - 将每个用户的交易数据转换为DataFrame
+    - 对单个用户数据进行预处理
+    - 生成该用户的所有样本后再处理下一个用户
+    
+    优势：
+    - 内存占用更低，不需要一次性加载整个文件
+    - 更好的流式处理，适合大文件
+    - 保持用户级别的数据完整性
+    """
+    
+    def __init__(self, file_paths, preprocessor, dataset_builder, debug_print_func=None):
+        """
+        Args:
+            file_paths: 训练文件路径列表
+            preprocessor: 数据预处理器
+            dataset_builder: 数据集构建函数，接收处理后的DataFrame，返回Dataset
+            debug_print_func: 调试打印函数
+        """
+        self.file_paths = file_paths
+        self.preprocessor = preprocessor
+        self.dataset_builder = dataset_builder
+        self.debug_print = debug_print_func if debug_print_func else print
+        
+        # 定义交易字段名称和顺序
+        self.trx_field_names = [
+            '发卡机构地址', '发卡机构银行', '卡等级', 'year', 'month', 'day',
+            'hour', 'minutes', 'seconds', 'unix_timestamp', '收单机构地址',
+            '收单机构银行', 'cups_交易代码', '交易渠道', 'cups_服务点输入方式',
+            'cups_应答码', 'cups_商户类型', 'cups_连接方式', 'cups_受卡方名称地址',
+            '交易金额'
+        ]
+        
+        # 记录数据集信息
+        self._log_dataset_info()
+    
+    @staticmethod
+    def collate_fn(batch):
+        """批处理函数，与ColesDataset保持一致"""
+        from operator import iadd
+        from functools import reduce
+        from ptls.data_load.utils import collate_feature_dict
+        import torch
+        
+        class_labels = [i for i, class_samples in enumerate(batch) for _ in class_samples]
+        batch = reduce(iadd, batch)
+        padded_batch = collate_feature_dict(batch)
+        return padded_batch, torch.LongTensor(class_labels)
+    
+    @rank_zero_only
+    def _log_dataset_info(self):
+        """记录数据集基本信息"""
+        self.debug_print(f"\n=== StreamingUserColesIterableDataset 初始化 ===")
+        self.debug_print(f"总文件数: {len(self.file_paths)}")
+        self.debug_print(f"文件列表: {[os.path.basename(f) for f in self.file_paths[:5]]}{'...' if len(self.file_paths) > 5 else ''}")
+        self.debug_print(f"流式处理模式: 用户级逐行读取")
+        self.debug_print(f"=== 数据集初始化完成 ===\n")
+    
+    def __iter__(self):
+        """迭代器实现，支持分布式训练的流式用户级读取"""
+        # 获取分布式训练信息
+        rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+        world_size = torch.distributed.get_world_size() if torch.distributed.is_initialized() else 1
+        
+        # 处理文件数量少于进程数的情况：循环分配文件
+        if len(self.file_paths) < world_size:
+            # 通过循环索引确保每个进程都能分配到文件
+            file_list = [self.file_paths[i % len(self.file_paths)] for i in range(world_size)]
+        else:
+            file_list = self.file_paths
+        
+        # 获取worker信息（用于DataLoader多进程）
+        worker_info = get_worker_info()
+        if worker_info is not None:
+            # 在DataLoader多进程环境中
+            worker_id = worker_info.id
+            num_workers = worker_info.num_workers
+            
+            # 先按DDP进程分片，再按worker分片
+            files_per_rank = file_list[rank::world_size]
+            assigned_files = files_per_rank[worker_id::num_workers]
+            
+            self.debug_print(f"Worker {worker_id}/{num_workers} on rank {rank}/{world_size} processing {len(assigned_files)} files")
+        else:
+            # 单进程环境，只按DDP分片
+            assigned_files = file_list[rank::world_size]
+            self.debug_print(f"Rank {rank}/{world_size} processing {len(assigned_files)} files")
+        
+        # 如果当前进程仍然没有分配到文件，记录警告但不阻塞
+        if len(assigned_files) == 0:
+            self.debug_print(f"警告: Rank {rank} 没有分配到文件，将跳过训练")
+            return
+        
+        # 逐文件，逐用户处理
+        for file_idx, file_path in enumerate(assigned_files):
+            try:
+                self.debug_print(f"开始流式处理文件 {file_idx + 1}/{len(assigned_files)}: {os.path.basename(file_path)}")
+                
+                user_count = 0
+                total_samples = 0
+                
+                with open(file_path, "r", encoding="utf-8") as f:
+                    for line_idx, line in enumerate(f):
+                        try:
+                            # 解析用户数据
+                            user_data = json.loads(line)
+                            if 'trans' not in user_data:
+                                continue
+                            
+                            records = user_data['trans']
+                            if not records:
+                                continue
+                            
+                            # 转换为DataFrame
+                            df = pd.DataFrame(records, columns=self.trx_field_names)
+                            
+                            # 设置client_id（使用原始user_id或行号）
+                            client_id = user_data.get('user_id', f"{file_idx}_{line_idx}")
+                            df['client_id'] = client_id
+                            
+                            # 将字符串格式的时间字段转换为数值类型
+                            time_cols = ['year', 'month', 'day', 'hour', 'minutes', 'seconds']
+                            for col in time_cols:
+                                if col in df.columns:
+                                    df[col] = pd.to_numeric(df[col], errors='coerce')
+                            
+                            # 预处理单个用户的数据
+                            processed = self.preprocessor.fit_transform(df)
+                            
+                            # 构建数据集并生成样本
+                            dataset = self.dataset_builder(processed)
+                            
+                            user_sample_count = 0
+                            for sample in dataset:
+                                yield sample
+                                user_sample_count += 1
+                            
+                            user_count += 1
+                            total_samples += user_sample_count
+                            
+                            # 每处理1000个用户打印一次进度
+                            if user_count % 1000 == 0:
+                                self.debug_print(f"文件 {os.path.basename(file_path)}: 已处理 {user_count} 个用户，生成 {total_samples} 个样本")
+                                
+                        except json.JSONDecodeError as e:
+                            self.debug_print(f"JSON解析错误，跳过行 {line_idx}: {str(e)}")
+                            continue
+                        except Exception as e:
+                            self.debug_print(f"处理用户数据时出错，跳过行 {line_idx}: {str(e)}")
+                            continue
+                
+                self.debug_print(f"文件 {os.path.basename(file_path)} 流式处理完成，处理了 {user_count} 个用户，生成 {total_samples} 个样本")
+                
+            except Exception as e:
+                self.debug_print(f"处理文件 {file_path} 时出错: {str(e)}")
+                # 继续处理下一个文件，不中断整个训练过程
+                continue
+
+
+class MultiFileIterableDataset(IterableDataset):
+    """保持向后兼容的原始实现"""
+    def __init__(self, file_paths, preprocessor, dataset_builder):
+        self.file_paths = file_paths
+        self.preprocessor = preprocessor
+        self.dataset_builder = dataset_builder
+
+    def __iter__(self):
+        # 获取当前DDP进程rank和总数
+        rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+        world_size = torch.distributed.get_world_size() if torch.distributed.is_initialized() else 1
+
+        # 分片文件列表
+        assigned_files = self.file_paths[rank::world_size]
+
+        for path in assigned_files:
+            df = load_jsonl_as_dataframe_new_format(path)
+            processed = self.preprocessor.fit_transform(df)
+            dataset = self.dataset_builder(processed)
+            for sample in dataset:
+                yield sample
 
 
 @rank_zero_only

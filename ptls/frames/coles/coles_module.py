@@ -52,7 +52,7 @@ class CoLESModule(ABSModule):
                                    sampling_strategy=HardNegativePairSelector(neg_count=5))
 
         if validation_metric is None:
-            validation_metric = BatchRecallTopK(K=4, metric='cosine')
+            validation_metric = BatchRecallTopK(K=2, metric='cosine')
 
         super().__init__(validation_metric,
                          seq_encoder,
