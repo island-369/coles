@@ -19,18 +19,25 @@ class MultiFileColesIterableDataset(IterableDataset):
     支持分布式训练，每个进程处理不同的文件子集。
     """
     
-    def __init__(self, file_paths, preprocessor, dataset_builder, debug_print_func=None):
+    def __init__(self, file_paths, preprocessor, dataset_builder, debug_print_func=None, max_files=None):
         """
         Args:
             file_paths: 训练文件路径列表
             preprocessor: 数据预处理器
             dataset_builder: 数据集构建函数，接收处理后的DataFrame，返回Dataset
             debug_print_func: 调试打印函数
+            max_files: 最大处理文件数量，None表示处理所有文件
         """
-        self.file_paths = file_paths
+        # 限制文件数量
+        if max_files is not None and max_files > 0:
+            self.file_paths = file_paths[:max_files]
+        else:
+            self.file_paths = file_paths
+            
         self.preprocessor = preprocessor
         self.dataset_builder = dataset_builder
         self.debug_print = debug_print_func if debug_print_func else print
+        self.max_files = max_files
         
         # 记录数据集信息
         self._log_dataset_info()
@@ -238,8 +245,24 @@ class StreamingUserColesIterableDataset(IterableDataset):
                             if not records:
                                 continue
                             
+                            # 检查并处理列数不匹配的情况，采用之前的处理逻辑
+                            processed_records = []
+                            for trx_array in records:
+                                if isinstance(trx_array, list) and len(trx_array) >= len(self.trx_field_names):
+                                    # 只取前20个字段，避免列数不匹配
+                                    trx_dict = {}
+                                    for i, field_name in enumerate(self.trx_field_names):
+                                        trx_dict[field_name] = trx_array[i]
+                                    processed_records.append(trx_dict)
+                                else:
+                                    self.debug_print(f"Warning: Invalid transaction format, expected >= {len(self.trx_field_names)} columns, got {len(trx_array) if isinstance(trx_array, list) else 'non-list'}")
+                                    continue
+                            
+                            if not processed_records:
+                                continue
+                            
                             # 转换为DataFrame
-                            df = pd.DataFrame(records, columns=self.trx_field_names)
+                            df = pd.DataFrame(processed_records)
                             
                             # 设置client_id（使用原始user_id或行号）
                             client_id = user_data.get('user_id', f"{file_idx}_{line_idx}")

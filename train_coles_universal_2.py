@@ -1,8 +1,8 @@
-import json
 import os
 import sys
 import time
 import glob
+import json
 from datetime import datetime
 from functools import partial
 from tqdm import tqdm
@@ -33,7 +33,11 @@ from ptls.preprocessing import (
 from encode_3 import UniversalFeatureEncoder
 from config import init_config
 # from train_coles import load_jsonl_as_dataframe_new_format
-from data_load_xqy import load_jsonl_as_dataframe_new_format, MultiFileColesIterableDataset
+from data_load_xqy import load_jsonl_as_dataframe_new_format, MultiFileColesIterableDataset, StreamingUserColesIterableDataset
+from pytorch_lightning.profilers import PyTorchProfiler
+import torch.profiler
+
+
 
 
 
@@ -104,7 +108,7 @@ class SmartLogger:
         if self.log_file is not None:
             self.console_output.flush()
 
-# 重定向stdout到智能日志系统（只在主进程中执行）
+# 重定向stdout到日志（只在主进程中执行）
 original_stdout = sys.stdout
 if log_file is not None:
     sys.stdout = SmartLogger(log_file, original_stdout)
@@ -133,8 +137,8 @@ class MetricsTracker(Callback):
     
     def __init__(self):
         super().__init__()
-        self.train_losses = []
-        self.val_metrics = []  # 改为记录验证指标（recall@top_k）
+        self.train_losses = []   # 训练过程损失
+        self.val_metrics = []    # 验证指标（recall@top_k）
         self.epochs = []
         self.epoch_start_time = None
         self.validation_start_time = None
@@ -154,13 +158,11 @@ class MetricsTracker(Callback):
         debug_print(f"Available callback_metrics keys: {list(trainer.callback_metrics.keys())}")
         debug_print(f"All callback_metrics: {trainer.callback_metrics}")
         
-        # 尝试多种可能的训练损失键名
+        # 获取训练损失
         train_loss = None
-        for key in ['train_loss', 'loss', 'train/loss']:
-            if key in trainer.callback_metrics:
-                train_loss = trainer.callback_metrics[key].item()
-                debug_print(f"Found aggregated train loss with key '{key}' from callback_metrics: {train_loss:.4f}")
-                break
+        if 'loss' in trainer.callback_metrics:
+            train_loss = trainer.callback_metrics['loss'].item()
+            debug_print(f"Found aggregated train loss with key 'loss' from callback_metrics: {train_loss:.4f}")
         
         if train_loss is not None:
             self.train_losses.append(train_loss)
@@ -170,11 +172,9 @@ class MetricsTracker(Callback):
             
         # 在训练 epoch 结束时也尝试记录验证指标
         val_metric = None
-        for key in ['valid/recall_top_k', 'valid/BatchRecallTopK', 'val_recall_top_k', 'recall_top_k']:
-            if key in trainer.callback_metrics:
-                val_metric = trainer.callback_metrics[key].item()
-                debug_print(f"Found aggregated validation metric with key '{key}' from callback_metrics: {val_metric:.4f}")
-                break
+        if 'valid/recall_top_k' in trainer.callback_metrics:
+            val_metric = trainer.callback_metrics['valid/recall_top_k'].item()
+            debug_print(f"Found aggregated validation metric with key 'valid/recall_top_k' from callback_metrics: {val_metric:.4f}")
         
         if val_metric is not None:
             # 检查是否已经记录过当前 epoch 的验证指标，避免重复记录
@@ -209,13 +209,11 @@ class MetricsTracker(Callback):
         debug_print(f"Available callback_metrics keys: {list(trainer.callback_metrics.keys())}")
         debug_print(f"All callback_metrics: {trainer.callback_metrics}")
         
-        # 尝试多种可能的验证指标键名（recall@top_k）
+        # 获取验证指标（recall@top_k）
         val_metric = None
-        for key in ['valid/recall_top_k']:
-            if key in trainer.callback_metrics:
-                val_metric = trainer.callback_metrics[key].item()
-                debug_print(f"Found aggregated validation metric with key '{key}' from callback_metrics: {val_metric:.4f}")
-                break
+        if 'valid/recall_top_k' in trainer.callback_metrics:
+            val_metric = trainer.callback_metrics['valid/recall_top_k'].item()
+            debug_print(f"Found aggregated validation metric with key 'valid/recall_top_k' from callback_metrics: {val_metric:.4f}")
         
         if val_metric is not None:
              # 检查是否已经记录过当前 epoch 的验证指标，避免重复记录
@@ -529,9 +527,9 @@ def create_feature_config_for_universal_encoder(config_path='feature_config.json
 
 
 def train_continuous_coles_universal(train_dir, val_dir, config):
-    """使用MultiFileColesIterableDataset进行连续训练的CoLES模型
+    """使用StreamingUserColesIterableDataset进行多个文件连续训练的CoLES模型
     
-    这个函数将多个训练文件整合成一个连续的数据流，只创建一次Trainer进行训练。
+    这将多个训练文件整合成一个连续的文件流，只创建一次Trainer进行训练。
     相比逐文件训练，这种方式可以保持参数状态的连续性，避免重复创建Trainer的开销。
     
     Args:
@@ -543,7 +541,7 @@ def train_continuous_coles_universal(train_dir, val_dir, config):
         tuple: (model, metrics_tracker)
     """
     # 记录函数开始时间
-    function_start_time = print_time_point("=== 连续训练函数开始 ===")
+    function_start_time = print_time_point("=== 训练函数开始 ===")
     
     output_dir = './output'
     os.makedirs(output_dir, exist_ok=True)
@@ -670,18 +668,17 @@ def train_continuous_coles_universal(train_dir, val_dir, config):
             ),
         )
     
-    # 创建训练数据的多文件可迭代数据集
-    debug_print("\n=== 创建训练数据MultiFileColesIterableDataset ===")
-    train_iterable_dataset = MultiFileColesIterableDataset(
+    # 使用流式用户级读取数据集
+    debug_print("\n=== 创建训练数据StreamingUserColesIterableDataset（流式用户级读取）===")
+    train_iterable_dataset = StreamingUserColesIterableDataset(
         file_paths=train_files,
         preprocessor=preprocessor,
         dataset_builder=build_dataset_from_df,
         debug_print_func=debug_print
     )
     
-    # 创建验证数据的多文件可迭代数据集（流式加载）
-    debug_print("\n=== 创建验证数据MultiFileColesIterableDataset ===")
-    valid_iterable_dataset = MultiFileColesIterableDataset(
+    debug_print("\n=== 创建验证数据StreamingUserColesIterableDataset（流式用户级读取）===")
+    valid_iterable_dataset = StreamingUserColesIterableDataset(
         file_paths=val_files,
         preprocessor=preprocessor,
         dataset_builder=build_dataset_from_df,
@@ -701,6 +698,24 @@ def train_continuous_coles_universal(train_dir, val_dir, config):
     # 创建指标跟踪器
     metrics_tracker = MetricsTracker()
     
+    # 配置性能监控器
+    debug_print("\n=== 配置性能监控器 ===")
+    is_dist = torch.distributed.is_initialized()
+    should_profile = (not is_dist) or (torch.distributed.get_rank() == 0)
+    
+    if should_profile:
+        debug_print("启用性能监控 - 当前进程将进行性能分析")
+        profiler = PyTorchProfiler(
+            on_trace_ready=torch.profiler.tensorboard_trace_handler('./logs/torch_prof_lightning'),
+            profile_memory=True,
+            record_shapes=True,
+            with_stack=True,
+            schedule=None,
+        )
+    else:
+        debug_print("跳过性能监控 - 非主进程或非分布式环境")
+        profiler = None
+    
     # 创建Trainer（只创建一次）
     debug_print("\n=== 创建Trainer（只创建一次）===")
     trainer = pl.Trainer(
@@ -715,6 +730,7 @@ def train_continuous_coles_universal(train_dir, val_dir, config):
         val_check_interval=1.0,
         logger=False,
         enable_model_summary=True,
+        profiler=profiler,
     )
     
     # 开始训练（一次性训练所有epochs）
@@ -762,635 +778,20 @@ def train_continuous_coles_universal(train_dir, val_dir, config):
         json.dump(metrics_data, f, indent=2, ensure_ascii=False)
     debug_print(f"训练指标已保存到: {metrics_save_path}")
     
+    # 性能监控结果说明
+    if should_profile and profiler is not None:
+        debug_print("\n=== 性能监控结果 ===")
+        debug_print("性能分析数据已保存到: ./logs/torch_prof_lightning/")
+        debug_print("查看性能分析结果的方法:")
+        debug_print("1. 启动TensorBoard: tensorboard --logdir=./logs/torch_prof_lightning")
+        debug_print("2. 在浏览器中打开: http://localhost:6006")
+        debug_print("3. 点击 'PROFILE' 标签页查看性能分析")
+        debug_print("4. 可以查看CPU/GPU使用率、内存使用、算子耗时等详细信息")
+    
     print_time_point("连续训练函数完成", function_start_time)
     
     return model, metrics_tracker
 
-
-def train_incremental_coles_universal(train_dir, val_dir, config, checkpoint_dir='./checkpoints'):
-    """按epoch遍历文件训练CoLES模型
-    Args:
-        train_dir (str): 训练文件目录
-        val_dir (str): 验证文件目录  
-        config (dict): 配置字典
-        checkpoint_dir (str): 检查点保存目录
-    """
-    # 记录函数开始时间
-    function_start_time = print_time_point("=== 增量训练函数开始 ===")
-    
-
-    output_dir = './output'                   #保存图像结果
-    os.makedirs(output_dir, exist_ok=True)
-    os.makedirs(checkpoint_dir, exist_ok=True)
-    
-    model_config = config['model_config']     #模型参数
-    data_config = config['data_config']       #数据参数
-    train_config = config['train_config']     #训练参数
-    feature_config=config['feature_config']
-    
-    batch_size = train_config['batch_size']
-    epochs = train_config['epochs']
-    learning_rate = train_config['learning_rate']
-    model_dim = model_config['model_dim']
-    n_heads = model_config['n_heads']
-    n_layers = model_config['n_layers']
-    feature_fusion = model_config.get('feature_fusion', 'concat')
-    
-    # 从配置文件中读取嵌入维度配置和数值特征配置
-    emb_dim_cfg = config.get('universal_encoder_config', {}).get('emb_dim_cfg', {})
-    num_fbr_cfg = config.get('universal_encoder_config', {}).get('num_fbr_cfg', {})
-
-    # 如果配置文件中没有相应配置，则使用默认值
-    if not emb_dim_cfg:
-        debug_print("no emb_dim_cfg")
-    else:
-        debug_print("emb_dim_cfg",emb_dim_cfg)
-        
-    if not num_fbr_cfg:
-        debug_print("no num_fbr_cfg")
-    else:
-        debug_print("num_fbr_cfg",num_fbr_cfg)    
-
-    # 记录文件扫描开始时间
-    file_scan_start_time = print_time_point("开始扫描训练和验证文件")
-    
-    # 获取训练文件列表（可能需要shuffle？）
-    train_files = sorted(glob.glob(os.path.join(train_dir, "*.jsonl")))
-    val_files = sorted(glob.glob(os.path.join(val_dir, "*.jsonl")))
-    
-    if not train_files:
-        raise ValueError(f"在目录 {train_dir} 中没有找到任何jsonl文件")
-    else:
-        debug_print(f"找到 {len(train_files)} 个训练文件: {[os.path.basename(f) for f in train_files]}")
-    if not val_files:
-        raise ValueError(f"在目录 {val_dir} 中没有找到任何jsonl文件")
-    else:
-        debug_print(f"找到 {len(val_files)} 个验证文件: {[os.path.basename(f) for f in val_files]}")
-    
-    # 记录文件扫描完成时间
-    print_time_point("文件扫描完成", file_scan_start_time)
-    
-
-    # 记录预处理器创建开始时间
-    preprocessor_start_time = print_time_point("开始创建数据预处理器")
-    
-    # 从feature_config中提取预定义映射
-    predefined_mappings = extract_predefined_mappings_from_feature_config(feature_config)
-    categorical_columns = get_categorical_columns_from_feature_config(feature_config)
-    
-    # 数据预处理器
-    preprocessor = PandasDataPreprocessor(
-        col_id='client_id',
-        col_event_time='unix_timestamp',
-        event_time_transformation='none',
-        cols_category=categorical_columns,
-        cols_category_with_mapping=predefined_mappings,
-        cols_numerical=['交易金额'],
-        return_records=True
-    )
-    
-    # 记录预处理器创建完成时间
-    print_time_point("数据预处理器创建完成", preprocessor_start_time)
-    
-    # 记录验证数据加载开始时间
-    val_data_start_time = print_time_point("开始加载验证数据")
-    
-    # 加载验证数据，目前加载单个jsonl文件,后续可能需要改成多文件加载
-    debug_print("\n=== 加载验证数据 ===")
-    source_data_val = load_jsonl_as_dataframe_new_format("test_directory/val/train copy.jsonl")
-    # print("source_data_val",source_data_val)
-    # 通过preprocessor.fit_transform已经对原数据进行了预处理
-    valid_data = preprocessor.fit_transform(source_data_val)
-    debug_print("\n=== 验证数据预处理完成 ===")
-    
-    # 记录验证数据加载完成时间
-    print_time_point("验证数据加载和预处理完成", val_data_start_time)
-
-    # 记录模型创建开始时间
-    model_creation_start_time = print_time_point("开始创建模型")
-    
-    # 创建模型（只创建一次）
-    universal_feature_config = feature_config
-    
-    trx_encoder = UniversalTrxEncoder(
-        feature_config=universal_feature_config,
-        emb_dim_cfg=emb_dim_cfg,
-        num_fbr_cfg=num_fbr_cfg,
-        feature_fusion=feature_fusion,
-        embeddings_noise=0.003,
-        linear_projection_size=model_dim
-    )
-    
-    seq_encoder = TransformerSeqEncoder(
-        trx_encoder=trx_encoder,
-        input_size=None,
-        is_reduce_sequence=True,
-        n_heads=n_heads,
-        n_layers=n_layers,
-        dropout=0.1,
-        dim_hidden=model_dim*4
-    )
-    
-    model = CoLESModule(
-        seq_encoder=seq_encoder,
-        optimizer_partial=partial(torch.optim.Adam, lr=learning_rate),
-        lr_scheduler_partial=partial(
-            torch.optim.lr_scheduler.StepLR, step_size=30, gamma=0.9
-        )
-    )
-    
-    # 记录模型创建完成时间
-    print_time_point("模型创建完成", model_creation_start_time)
-    
-    # 全局指标跟踪
-    all_train_losses = []
-    all_val_metrics = []
-    all_epochs = []
-    
-    # 创建全局指标跟踪器
-    global_metrics_tracker = MetricsTracker()
-    
-    # 记录整体训练开始时间
-    overall_training_start_time = print_time_point("=== 开始整体训练过程 ===")
-    
-
-    
-    # 按epoch遍历训练
-    for epoch in range(epochs):
-        # 记录当前epoch开始时间
-        epoch_start_time = print_time_point(f"=== 开始第 {epoch + 1}/{epochs} 个Epoch ===")
-        
-        epoch_train_losses = []
-        epoch_val_metrics = []
-        
-        # 在每个epoch中遍历所有训练文件
-        # 可以通过设置max_files_per_epoch来限制每个epoch处理的文件数量
-        max_files_per_epoch = 50  # 设置最大处理文件数，比如只处理前50个文件
-        files_to_process = min(len(train_files), max_files_per_epoch)
-        
-        # 使用tqdm显示epoch级别的进度条
-        epoch_desc = f"Epoch {epoch + 1}/{epochs}"
-        file_pbar = tqdm(train_files[:files_to_process], 
-                        desc=epoch_desc,
-                        unit="file",
-                        ncols=120,
-                        file=sys.stdout,
-                        leave=True)
-        
-        for file_idx, train_file in enumerate(file_pbar):
-            # 更新进度条描述，显示当前文件名和指标
-            current_file = os.path.basename(train_file)
-            avg_loss = sum(epoch_train_losses) / len(epoch_train_losses) if epoch_train_losses else 0.0
-            avg_val = sum(epoch_val_metrics) / len(epoch_val_metrics) if epoch_val_metrics else 0.0
-            
-            file_pbar.set_postfix({
-                'file': current_file[:20] + '...' if len(current_file) > 20 else current_file,
-                'avg_loss': f'{avg_loss:.4f}' if avg_loss > 0 else 'N/A',
-                'avg_val': f'{avg_val:.4f}' if avg_val > 0 else 'N/A'
-            })
-            
-            file_start_time = print_time_point(f"Epoch {epoch + 1}, 开始处理文件 {file_idx + 1}/{files_to_process}: {os.path.basename(train_file)}")
-            
-            # 加载和预处理当前训练文件
-            data_load_start_time = print_time_point(f"开始加载文件 {os.path.basename(train_file)}")
-            
-            # 加载当前训练文件
-            source_data_train = load_jsonl_as_dataframe_new_format(train_file)
-            train_data = preprocessor.fit_transform(source_data_train)
-            
-            
-            # 记录数据加载完成时间
-            print_time_point(f"文件 {os.path.basename(train_file)} 加载和预处理完成", data_load_start_time)
-
-            # 创建数据模块
-            datamodule = PtlsDataModule(
-                train_data=ColesDataset(
-                    MemoryMapDataset(
-                    # MemoryIterableDataset(
-                        data=train_data,
-                        i_filters=[SeqLenFilter(min_seq_len=1)],
-                    ),
-                    splitter=SampleSlices(
-                        split_count=5,
-                        cnt_min=1,
-                        cnt_max=5,
-                    ),
-                ),
-                valid_data=ColesDataset(
-                    MemoryMapDataset(
-                    # MemoryIterableDataset(
-                        data=valid_data,
-                        i_filters=[SeqLenFilter(min_seq_len=1)],
-                    ),
-                    splitter=SampleSlices(
-                        split_count=5,
-                        cnt_min=1,
-                        cnt_max=5,
-                    ),
-                ),
-                train_batch_size=batch_size,
-                train_num_workers=2,
-                valid_batch_size=batch_size,
-                valid_num_workers=2,
-            )
-            
-            # 创建文件级指标跟踪器
-            file_metrics_tracker = MetricsTracker()
-            
-            # 训练器配置 - 每个文件只训练1个epoch
-            
-            # 添加分布式训练调试信息
-            _log_distributed_info()
-            
-            # 动态控制模型摘要显示：只在第一次创建Trainer时显示
-            global _first_trainer_created
-            enable_summary = not _first_trainer_created
-            if not _first_trainer_created:
-                _first_trainer_created = True
-                debug_print("首次创建Trainer，启用模型摘要显示")
-            else:
-                debug_print("非首次创建Trainer，禁用模型摘要显示")
-            
-            trainer = pl.Trainer(
-                max_epochs=1,
-                accelerator='gpu' if torch.cuda.is_available() else 'cpu',
-                strategy='ddp',
-                devices=2 if torch.cuda.is_available() else 'auto',
-                enable_progress_bar=False,             # 禁用trainer内置进度条，使用我们自定义的tqdm进度条
-                callbacks=[file_metrics_tracker],
-                enable_checkpointing=False,
-                check_val_every_n_epoch=1,
-                val_check_interval=1.0,
-                logger=False,                         # 禁用默认logger输出
-                enable_model_summary=enable_summary,  # 动态控制模型参数统计信息的自动输出
-            )
-            
-            # 添加优化器调试信息
-            _log_optimizer_info(model, train_file)
-            
-            # 添加数据加载调试信息
-            _log_data_info(datamodule, train_data, valid_data, batch_size)
-            
-            # 记录训练开始时间
-            training_start_time = print_time_point(f"开始训练文件 {os.path.basename(train_file)}")
-            
-            # 训练当前文件
-            debug_print(f"开始训练文件 {os.path.basename(train_file)}...")
-            trainer.fit(model, datamodule)
-            debug_print(f"文件 {os.path.basename(train_file)} 训练完成")
-            
-            # 训练后检查分布式状态（此时分布式已正确初始化）
-            debug_print(f"\n=== 训练后分布式状态检查 ===\n")
-            if torch.distributed.is_available():
-                debug_print(f"分布式后端可用: True")
-                if torch.distributed.is_initialized():
-                    debug_print(f"分布式已初始化: True")
-                    debug_print(f"当前进程rank: {torch.distributed.get_rank()}")
-                    debug_print(f"总进程数world_size: {torch.distributed.get_world_size()}")
-                    debug_print(f"分布式后端: {torch.distributed.get_backend()}")
-                else:
-                    debug_print(f"分布式已初始化: False")
-            else:
-                debug_print(f"分布式后端可用: False")
-            debug_print(f"=== 分布式状态检查结束 ===\n")
-            
-            # 记录训练完成时间
-            print_time_point(f"文件 {os.path.basename(train_file)} 训练完成", training_start_time)
-            debug_print(f"file_metrics_tracker.train_losses: {file_metrics_tracker.train_losses}")
-            debug_print(f"file_metrics_tracker.val_metrics: {file_metrics_tracker.val_metrics}")
-            debug_print(f"file_metrics_tracker.epochs: {file_metrics_tracker.epochs}")
-            # 训练后的优化器状态
-            debug_print(f"\n=== 训练后优化器状态 (文件: {os.path.basename(train_file)}) ===")
-            optimizers_after = model.configure_optimizers()
-            if isinstance(optimizers_after, tuple) and len(optimizers_after) >= 2:
-                optimizer_list_after, scheduler_list_after = optimizers_after
-                if optimizer_list_after:
-                    optimizer_after = optimizer_list_after[0]
-                    debug_print(f"训练后学习率: {optimizer_after.param_groups[0]['lr']:.6f}")
-                    
-                    if hasattr(optimizer_after, 'state') and optimizer_after.state:
-                        debug_print(f"训练后优化器状态字典大小: {len(optimizer_after.state)}")
-                        first_param_after = next(iter(optimizer_after.state.keys()), None)
-                        if first_param_after is not None:
-                            state_after = optimizer_after.state[first_param_after]
-                            if 'step' in state_after:
-                                debug_print(f"训练后优化器步数: {state_after['step']}")
-            debug_print("=== 训练后优化器状态结束 ===\n")
-            
-            # 收集当前文件的指标
-            if file_metrics_tracker.train_losses:
-                epoch_train_losses.extend(file_metrics_tracker.train_losses)
-            if file_metrics_tracker.val_metrics:
-                epoch_val_metrics.extend(file_metrics_tracker.val_metrics)
-            
-            # 更新tqdm进度条显示最新指标
-            current_file = os.path.basename(train_file)
-            avg_loss = sum(epoch_train_losses) / len(epoch_train_losses) if epoch_train_losses else 0.0
-            avg_val = sum(epoch_val_metrics) / len(epoch_val_metrics) if epoch_val_metrics else 0.0
-            
-            file_pbar.set_postfix({
-                'file': current_file[:20] + '...' if len(current_file) > 20 else current_file,
-                'avg_loss': f'{avg_loss:.4f}' if avg_loss > 0 else 'N/A',
-                'avg_val': f'{avg_val:.4f}' if avg_val > 0 else 'N/A',
-                'status': 'completed'
-            })
-            
-            # 释放内存
-            del source_data_train, train_data, datamodule
-            torch.cuda.empty_cache() if torch.cuda.is_available() else None
-            
-            # 记录单个文件处理完成时间
-            print_time_point(f"文件 {os.path.basename(train_file)} 处理完成", file_start_time)
-        
-        # 计算当前epoch的平均指标
-        if epoch_train_losses:
-            avg_train_loss = sum(epoch_train_losses) / len(epoch_train_losses)
-            all_train_losses.append(avg_train_loss)
-            global_metrics_tracker.train_losses.append(avg_train_loss)
-            debug_print(f"Epoch {epoch + 1} 平均训练损失: {avg_train_loss:.4f}")
-        
-        if epoch_val_metrics:
-            avg_val_metric = sum(epoch_val_metrics) / len(epoch_val_metrics)
-            all_val_metrics.append(avg_val_metric)
-            global_metrics_tracker.val_metrics.append(avg_val_metric)
-            global_metrics_tracker.epochs.append(epoch)
-            debug_print(f"Epoch {epoch + 1} 平均验证指标: {avg_val_metric:.4f}")
-        
-        all_epochs.append(epoch)
-        
-        # 关闭当前epoch的进度条
-        file_pbar.close()
-        
-        # 显示epoch完成总结
-        final_avg_loss = sum(epoch_train_losses) / len(epoch_train_losses) if epoch_train_losses else 0.0
-        final_avg_val = sum(epoch_val_metrics) / len(epoch_val_metrics) if epoch_val_metrics else 0.0
-        print(f"\n✓ Epoch {epoch + 1}/{epochs} 完成 - 处理了 {files_to_process} 个文件")
-        print(f"  最终平均损失: {final_avg_loss:.4f}")
-        print(f"  最终平均验证指标: {final_avg_val:.4f}")
-        print("-" * 80)
-        
-        # 记录当前epoch完成时间
-        print_time_point(f"第 {epoch + 1}/{epochs} 个Epoch 完成", epoch_start_time)
-        
-        # 每5个epoch保存一次检查点
-        # if (epoch + 1) % 5 == 0:
-        #     checkpoint_path = os.path.join(checkpoint_dir, f'checkpoint_epoch_{epoch + 1}.pth')
-        #     torch.save({
-        #         'model_state_dict': model.seq_encoder.state_dict(),
-        #         'epoch': epoch + 1,
-        #         'train_losses': all_train_losses,
-        #         'val_metrics': all_val_metrics,
-        #         'epochs': all_epochs
-        #     }, checkpoint_path)
-        #     print(f"检查点已保存到: {checkpoint_path}")
-    
-    # 记录整体训练完成时间
-    print_time_point("=== 整体训练过程完成 ===", overall_training_start_time)
-    
-    # 记录后处理开始时间
-    post_processing_start_time = print_time_point("开始生成最终报告和保存结果")
-    
-    # 训练完成后的处理
-    debug_print("\n=== 所有文件训练完成，正在生成最终报告 ===")
-    
-    # 绘制指标图表
-    metrics_plot_path = os.path.join(output_dir, f'incremental_metrics_plot_{datetime.now().strftime("%Y%m%d_%H%M%S")}.png')
-    global_metrics_tracker.plot_metrics(save_path=metrics_plot_path)
-    
-    # 保存指标数据
-    metrics_data = {
-        'epoch': all_epochs,
-        'train_loss': all_train_losses,
-    }
-    
-    if all_val_metrics:
-        val_df = pd.DataFrame({
-            'epoch': list(range(len(all_val_metrics))),
-            'val_recall_top_k': all_val_metrics
-        })
-        
-        train_df = pd.DataFrame(metrics_data)
-        merged_df = train_df.merge(val_df, on='epoch', how='left')
-        
-        metrics_data_path = os.path.join(output_dir, f'incremental_metrics_data_{datetime.now().strftime("%Y%m%d_%H%M%S")}.csv')
-        merged_df.to_csv(metrics_data_path, index=False)
-        debug_print(f"增量训练指标数据已保存到: {metrics_data_path}")
-    
-    # 保存最终模型
-    final_model_path = os.path.join(output_dir, 'final_incremental_model_universal.pth')
-    torch.save(model.seq_encoder.state_dict(), final_model_path)
-    debug_print(f"最终模型已保存到: {final_model_path}")
-    
-    # 记录后处理完成时间
-    print_time_point("最终报告生成和结果保存完成", post_processing_start_time)
-    
-    # 记录函数完成时间
-    print_time_point("=== 增量训练函数完成 ===", function_start_time)
-    
-    return model, global_metrics_tracker
-
-
-@rank_zero_only
-def _log_distributed_info():
-    """记录分布式训练调试信息"""
-    debug_print(f"\n=== 分布式训练调试信息 ===")
-    debug_print(f"CUDA可用: {torch.cuda.is_available()}")
-    debug_print(f"CUDA设备数量: {torch.cuda.device_count()}")
-    
-    # 检查分布式环境变量
-    debug_print(f"WORLD_SIZE: {os.environ.get('WORLD_SIZE', 'Not set')}")
-    debug_print(f"RANK: {os.environ.get('RANK', 'Not set')}")
-    debug_print(f"LOCAL_RANK: {os.environ.get('LOCAL_RANK', 'Not set')}")
-    debug_print(f"MASTER_ADDR: {os.environ.get('MASTER_ADDR', 'Not set')}")
-    debug_print(f"MASTER_PORT: {os.environ.get('MASTER_PORT', 'Not set')}")
-    
-    # 显示当前使用的设备
-    if torch.cuda.is_available():
-        current_device = torch.cuda.current_device()
-        debug_print(f"当前CUDA设备: {current_device}")
-        debug_print(f"设备名称: {torch.cuda.get_device_name(current_device)}")
-    debug_print(f"=== 训练前环境信息结束 ===\n")
-
-# 全局标志，用于控制PyTorch Lightning模型摘要只在第一次显示
-_first_trainer_created = False
-
-def _log_optimizer_info(model, train_file):
-    """记录优化器状态调试信息"""
-    debug_print(f"\n=== 优化器状态调试信息 (文件: {os.path.basename(train_file)}) ===")
-    
-    # 获取当前优化器状态
-    optimizers = model.configure_optimizers()
-    if isinstance(optimizers, tuple) and len(optimizers) >= 2:
-        optimizer_list, scheduler_list = optimizers
-        if optimizer_list:
-            optimizer = optimizer_list[0]
-            debug_print(f"优化器类型: {type(optimizer).__name__}")
-            debug_print(f"当前学习率: {optimizer.param_groups[0]['lr']:.6f}")
-            debug_print(f"优化器参数组数量: {len(optimizer.param_groups)}")
-            
-            # 检查优化器状态
-            if hasattr(optimizer, 'state') and optimizer.state:
-                debug_print(f"优化器状态字典大小: {len(optimizer.state)}")
-                # 显示第一个参数的状态信息（如果存在）
-                first_param = next(iter(optimizer.state.keys()), None)
-                if first_param is not None:
-                    state = optimizer.state[first_param]
-                    debug_print(f"第一个参数状态键: {list(state.keys())}")
-                    if 'step' in state:
-                        debug_print(f"优化器步数: {state['step']}")
-            else:
-                debug_print("优化器状态为空 (新初始化)")
-                
-            # 显示调度器信息
-            if scheduler_list:
-                scheduler = scheduler_list[0]
-                if isinstance(scheduler, dict):
-                    scheduler = scheduler['scheduler']
-                debug_print(f"学习率调度器类型: {type(scheduler).__name__}")
-                if hasattr(scheduler, 'last_epoch'):
-                    debug_print(f"调度器当前epoch: {scheduler.last_epoch}")
-                if hasattr(scheduler, 'step_size'):
-                    debug_print(f"调度器步长: {scheduler.step_size}")
-                if hasattr(scheduler, 'gamma'):
-                    debug_print(f"调度器衰减因子: {scheduler.gamma}")
-    
-    # 显示模型参数的一些统计信息
-    total_params = sum(p.numel() for p in model.parameters())
-    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    debug_print(f"模型总参数数: {total_params:,}")
-    debug_print(f"可训练参数数: {trainable_params:,}")
-    
-    # 显示模型参数的梯度统计（如果有的话）
-    grad_norms = []
-    for name, param in model.named_parameters():
-        if param.grad is not None:
-            grad_norms.append(param.grad.norm().item())
-    
-    if grad_norms:
-        debug_print(f"参数梯度范数统计: 平均={sum(grad_norms)/len(grad_norms):.6f}, 最大={max(grad_norms):.6f}, 最小={min(grad_norms):.6f}")
-    else:
-        debug_print("当前无梯度信息")
-    
-    debug_print("=== 优化器状态调试信息结束 ===\n")
-
-def _log_data_info(datamodule, train_data, valid_data, batch_size):
-    """记录数据加载调试信息"""
-    debug_print(f"\n=== 数据加载调试信息 ===")
-    debug_print(f"训练数据大小: {len(train_data):,}")
-    debug_print(f"验证数据大小: {len(valid_data):,}")
-    debug_print(f"批次大小: {batch_size}")
-    debug_print(f"")
-    
-    # 检查数据加载器的分布式设置
-    train_dataloader = datamodule.train_dataloader()
-    debug_print(f"训练数据加载器类型: {type(train_dataloader)}")
-    if hasattr(train_dataloader, 'sampler'):
-        debug_print(f"训练数据采样器类型: {type(train_dataloader.sampler)}")
-    if hasattr(train_dataloader, 'batch_sampler'):
-        debug_print(f"训练批次采样器类型: {type(train_dataloader.batch_sampler)}")
-    
-    # 尝试获取一个批次来检查数据
-    try:
-        sample_batch = next(iter(train_dataloader))
-        print_main_only(f"\n=== 数据批次信息 ===")
-        print_main_only(f"sample_batch: {sample_batch}")
-        print_main_only(f"sample_batch类型: {type(sample_batch)}")
-        
-        # CoLES数据加载器返回的是元组 (padded_batch, class_labels)
-        # 统一处理逻辑：提取padded_batch和class_labels
-        padded_batch = None
-        class_labels = None
-        
-        if isinstance(sample_batch, tuple) and len(sample_batch) == 2:
-            # CoLES数据加载器返回的是元组 (padded_batch, class_labels)
-            padded_batch, class_labels = sample_batch
-            print_main_only(f"padded_batch类型: {type(padded_batch)}")
-            print_main_only(f"class_labels类型: {type(class_labels)}")
-        elif hasattr(sample_batch, 'payload'):
-            # 直接是PaddedBatch对象的情况
-            padded_batch = sample_batch
-            class_labels = None
-        else:
-            debug_print(f"未知的sample_batch格式: {type(sample_batch)}")
-            return
-        
-        # 统一处理padded_batch
-        if padded_batch and hasattr(padded_batch, 'payload'):
-            batch_size_actual = padded_batch.payload['event_time'].shape[0]
-            debug_print(f"实际批次大小: {batch_size_actual}")
-            debug_print(f"payload字段: {list(padded_batch.payload.keys())}")
-            
-            # 获取进程信息
-            rank = int(os.environ.get('RANK', 0))
-            local_rank = int(os.environ.get('LOCAL_RANK', 0))
-            world_size = int(os.environ.get('WORLD_SIZE', 1))
-            pid = os.getpid()
-            
-            # 显示样本标识（取前5个样本）
-            print_with_rank(f"当前批次大小: {batch_size_actual}")
-            sample_count = min(20, batch_size_actual)
-            
-            if 'event_time' in padded_batch.payload:
-                sample_times = padded_batch.payload['event_time'][:sample_count].tolist()
-                print_with_rank(f"样本时间戳 (前{sample_count}个): {sample_times}")
-                
-                if class_labels is not None:
-                    sample_labels = class_labels[:sample_count].tolist()
-                    print_with_rank(f"对应标签 (前{sample_count}个): {sample_labels}")
-            else:
-                # 使用批次索引作为标识
-                sample_indices = list(range(sample_count))
-                print_with_rank(f"样本索引 (前{sample_count}个): {sample_indices}")
-                
-                if class_labels is not None:
-                    sample_labels = class_labels[:sample_count].tolist()
-                    print_with_rank(f"对应标签 (前{sample_count}个): {sample_labels}")
-        else:
-            debug_print("padded_batch没有payload属性")
-            
-    except Exception as e:
-        debug_print(f"获取样本批次失败: {e}")
-    debug_print(f"=== 数据加载调试信息结束 ===\n")
-
-def print_with_rank(*args, **kwargs):
-    """带进程信息的打印函数，根据进程信息输出到不同的日志文件"""
-    rank = int(os.environ.get('RANK', 0))
-    local_rank = int(os.environ.get('LOCAL_RANK', 0))
-    world_size = int(os.environ.get('WORLD_SIZE', 1))
-    pid = os.getpid()
-    
-    # 格式化消息，添加进程信息前缀
-    message = ' '.join(str(arg) for arg in args)
-    formatted_message = f"[Rank {rank}/{world_size}, Local Rank {local_rank}, PID {pid}] {message}"
-    
-    # 根据进程信息创建日志文件名
-    log_filename = f"process_rank_{rank}_local_{local_rank}_pid_{pid}.log"
-    log_path = os.path.join("./logs_xqy", log_filename)
-    
-    # 确保日志目录存在
-    os.makedirs("./logs_xqy", exist_ok=True)
-    
-    # 获取当前时间戳
-    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
-    
-    # 写入日志文件
-    try:
-        with open(log_path, 'a', encoding='utf-8') as f:
-            f.write(f"[{timestamp}] {formatted_message}\n")
-            f.flush()  # 确保立即写入
-    except Exception as e:
-        # 如果写入文件失败，回退到终端输出
-        print(f"日志写入失败: {e}")
-        print(formatted_message, **kwargs)
-
-@rank_zero_only
-def print_main_only(*args, **kwargs):
-    """只在主进程输出的打印函数"""
-    print(*args, **kwargs)
-
-def safe_main_print(*args, **kwargs):
-    """主函数中的安全打印函数，只在主进程中执行"""
-    print(*args, **kwargs)
 
 if __name__ == '__main__':
     try:
@@ -1403,24 +804,14 @@ if __name__ == '__main__':
         # debug_print(config)
         print_time_point("配置加载完成", config_start_time)
         
-        # 训练模式配置
-        # 设置为 True 启用增量训练模式（逐文件训练）
-        # 设置为 False 使用普通训练模式（一次性加载所有数据）
-        INCREMENTAL_MODE = True  
-        
         # 训练和验证数据路径
         train_path = 'test_directory/train'  # 训练数据目录
         val_path = 'test_directory/val'      # 验证数据目录
         
-        # 训练模式选择
-        # INCREMENTAL_MODE = True: 逐文件训练（原有模式）
-        # INCREMENTAL_MODE = False: 普通训练模式
-        # CONTINUOUS_MODE = True: 连续训练模式（新增，使用MultiFileColesIterableDataset）
-        CONTINUOUS_MODE = True  # 新增的连续训练模式
-        
-        if CONTINUOUS_MODE:
+        # 使用连续训练模式
+        if True:
             debug_print("\n=== 启用连续训练模式 ===")
-            debug_print("使用MultiFileColesIterableDataset将多个文件整合为连续数据流，只创建一次Trainer")
+            debug_print("使用StreamingUserColesIterableDataset进行流式用户级读取，逐行处理用户数据")
             
             # 记录连续训练模式开始时间
             continuous_mode_start_time = print_time_point("连续训练模式开始")
@@ -1431,68 +822,15 @@ if __name__ == '__main__':
                 config=config
             )
             
-            # 记录连续训练模式完成时间
-            print_time_point("连续训练模式完成", continuous_mode_start_time)
+            # 记录训练完成时间
+            print_time_point("训练完成", continuous_mode_start_time)
             
-            debug_print(f"\n=== 连续训练总结 ===")
+            debug_print(f"\n=== 训练总结 ===")
             debug_print(f"训练完成时间: {datetime.now()}")
             debug_print(f"总训练epoch数: {config['train_config']['epochs']}")
             if metrics_tracker.val_metrics:
                 best_val_metric = max(metrics_tracker.val_metrics)
                 debug_print(f"最佳验证指标: {best_val_metric:.4f}")
-            debug_print(f"所有输出文件保存在: ./output/ 目录")
-            
-        elif INCREMENTAL_MODE:
-            debug_print("\n=== 启用增量训练模式 ===")
-            debug_print("将逐个文件进行训练，每个文件训练完成后保存检查点")
-            
-            # 记录增量训练模式开始时间
-            incremental_mode_start_time = print_time_point("增量训练模式开始")
-            
-            # 增量训练参数
-            checkpoint_dir = './checkpoints'  # 检查点保存目录
-            
-            model, metrics_tracker = train_incremental_coles_universal(
-                train_dir=train_path,
-                val_dir=val_path,
-                config=config,
-                checkpoint_dir=checkpoint_dir
-            )
-            
-            # 记录增量训练模式完成时间
-            print_time_point("增量训练模式完成", incremental_mode_start_time)
-            
-            debug_print(f"\n=== 增量训练总结 ===")
-            debug_print(f"训练完成时间: {datetime.now()}")
-            debug_print(f"总训练epoch数: {config['train_config']['epochs']}")
-            debug_print(f"检查点保存目录: {checkpoint_dir}")
-            if metrics_tracker.val_metrics:
-                best_val_metric = max(metrics_tracker.val_metrics)
-                debug_print(f"最佳验证指标: {best_val_metric:.4f}")
-            debug_print(f"所有输出文件保存在: ./output/ 目录")
-            
-        else:
-            debug_print("\n=== 启用普通训练模式 ===")
-            debug_print("将一次性加载所有数据进行训练")
-            
-            # 记录普通训练模式开始时间
-            normal_mode_start_time = print_time_point("普通训练模式开始")
-            
-            # 可以传入文件路径或目录路径
-            # 示例：
-            # - 单文件模式: train_and_eval_coles_universal('train.jsonl', 'val.jsonl', config)
-            # - 多文件模式: train_and_eval_coles_universal('train/', 'val/', config)
-            # model, metrics_tracker = train_and_eval_coles_universal(train_path, val_path, config)
-            
-            # 记录普通训练模式完成时间
-            print_time_point("普通训练模式完成", normal_mode_start_time)
-            
-            # 训练完成后的额外信息
-            debug_print(f"\n=== 普通训练总结 ===")
-            debug_print(f"训练完成时间: {datetime.now()}")
-            if metrics_tracker.val_metrics:
-                best_epoch = metrics_tracker.epochs[metrics_tracker.val_metrics.index(max(metrics_tracker.val_metrics))]
-                debug_print(f"最佳验证指标出现在第 {best_epoch} 个epoch")
             debug_print(f"所有输出文件保存在: ./output/ 目录")
         
         # 记录主程序完成时间
