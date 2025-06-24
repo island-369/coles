@@ -5,127 +5,15 @@ import json
 import pandas as pd
 from pytorch_lightning.utilities.rank_zero import rank_zero_only
 import ptls
+import itertools
+import random
+import time
 
 
 from torch.utils.data import IterableDataset, get_worker_info
 import torch
 import os
 from pytorch_lightning.utilities.rank_zero import rank_zero_only
-
-class MultiFileColesIterableDataset(IterableDataset):
-    """改进的多文件可迭代数据集，支持分布式训练和连续数据流
-    
-    这个数据集将多个训练文件整合成一个连续的数据流，避免了重复创建Trainer的开销。
-    支持分布式训练，每个进程处理不同的文件子集。
-    """
-    
-    def __init__(self, file_paths, preprocessor, dataset_builder, debug_print_func=None, max_files=None):
-        """
-        Args:
-            file_paths: 训练文件路径列表
-            preprocessor: 数据预处理器
-            dataset_builder: 数据集构建函数，接收处理后的DataFrame，返回Dataset
-            debug_print_func: 调试打印函数
-            max_files: 最大处理文件数量，None表示处理所有文件
-        """
-        # 限制文件数量
-        if max_files is not None and max_files > 0:
-            self.file_paths = file_paths[:max_files]
-        else:
-            self.file_paths = file_paths
-            
-        self.preprocessor = preprocessor
-        self.dataset_builder = dataset_builder
-        self.debug_print = debug_print_func if debug_print_func else print
-        self.max_files = max_files
-        
-        # 记录数据集信息
-        self._log_dataset_info()
-    
-    @staticmethod
-    def collate_fn(batch):
-        """批处理函数，与ColesDataset保持一致"""
-        from operator import iadd
-        from functools import reduce
-        from ptls.data_load.utils import collate_feature_dict
-        import torch
-        
-        class_labels = [i for i, class_samples in enumerate(batch) for _ in class_samples]
-        batch = reduce(iadd, batch)
-        padded_batch = collate_feature_dict(batch)
-        return padded_batch, torch.LongTensor(class_labels)
-    
-    @rank_zero_only
-    def _log_dataset_info(self):
-        """记录数据集基本信息"""
-        self.debug_print(f"\n=== MultiFileColesIterableDataset 初始化 ===")
-        self.debug_print(f"总文件数: {len(self.file_paths)}")
-        self.debug_print(f"文件列表: {[os.path.basename(f) for f in self.file_paths[:5]]}{'...' if len(self.file_paths) > 5 else ''}")
-        self.debug_print(f"=== 数据集初始化完成 ===\n")
-    
-    def __iter__(self):
-        """迭代器实现，支持分布式训练"""
-        # 获取分布式训练信息
-        rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
-        world_size = torch.distributed.get_world_size() if torch.distributed.is_initialized() else 1
-        
-        # 处理文件数量少于进程数的情况：循环分配文件
-        if len(self.file_paths) < world_size:
-            # 通过循环索引确保每个进程都能分配到文件
-            extended_files = []
-            for i in range(world_size):
-                file_idx = i % len(self.file_paths)
-                extended_files.append(self.file_paths[file_idx])
-            file_list = extended_files
-        else:
-            file_list = self.file_paths
-        
-        # 获取worker信息（用于DataLoader多进程）
-        worker_info = get_worker_info()
-        if worker_info is not None:
-            # 在DataLoader多进程环境中
-            worker_id = worker_info.id
-            num_workers = worker_info.num_workers
-            
-            # 先按DDP进程分片，再按worker分片
-            files_per_rank = file_list[rank::world_size]
-            assigned_files = files_per_rank[worker_id::num_workers]
-            
-            self.debug_print(f"Worker {worker_id}/{num_workers} on rank {rank}/{world_size} processing {len(assigned_files)} files")
-        else:
-            # 单进程环境，只按DDP分片
-            assigned_files = file_list[rank::world_size]
-            self.debug_print(f"Rank {rank}/{world_size} processing {len(assigned_files)} files")
-        
-        # 如果当前进程仍然没有分配到文件，记录警告但不阻塞
-        if len(assigned_files) == 0:
-            self.debug_print(f"警告: Rank {rank} 没有分配到文件，将跳过训练")
-            return
-        
-        # 逐文件处理并生成样本
-        for file_idx, file_path in enumerate(assigned_files):
-            try:
-                self.debug_print(f"开始处理文件 {file_idx + 1}/{len(assigned_files)}: {os.path.basename(file_path)}")
-                
-                # 加载和预处理数据
-                df = load_jsonl_as_dataframe_new_format(file_path)
-                processed_data = self.preprocessor.fit_transform(df)
-                
-                # 构建数据集
-                dataset = self.dataset_builder(processed_data)
-                
-                # 生成样本
-                sample_count = 0
-                for sample in dataset:
-                    yield sample
-                    sample_count += 1
-                
-                self.debug_print(f"文件 {os.path.basename(file_path)} 处理完成，生成 {sample_count} 个样本")
-                
-            except Exception as e:
-                self.debug_print(f"处理文件 {file_path} 时出错: {str(e)}")
-                # 继续处理下一个文件，不中断整个训练过程
-                continue
 
 
 class StreamingUserColesIterableDataset(IterableDataset):
@@ -225,10 +113,30 @@ class StreamingUserColesIterableDataset(IterableDataset):
             self.debug_print(f"警告: Rank {rank} 没有分配到文件，将跳过训练")
             return
         
-        # 逐文件，逐用户处理
-        for file_idx, file_path in enumerate(assigned_files):
+        # 使用itertools.cycle无限循环assigned_files，避免分布式训练死锁
+        self.debug_print(f"开始无限循环处理文件，避免分布式训练死锁")
+        # 每次进入循环前对文件列表进行随机shuffle，避免过拟合
+        # self.debug_print(f"开始无限循环处理文件，避免分布式训练死锁")
+        
+        # 初始shuffle
+        # cycle_count = 0
+        # random.seed(int(time.time()) + rank + cycle_count)
+        # random.shuffle(assigned_files)
+        # self.debug_print(f"第{cycle_count + 1}轮循环开始，已进行初始shuffle")
+        
+        # 无限循环处理文件
+        for file_idx, file_path in enumerate(itertools.cycle(assigned_files)):
+            # 每完成一轮所有文件后，重新shuffle文件顺序
+            # if file_idx > 0 and file_idx % len(assigned_files) == 0:
+            #     cycle_count += 1
+            #     # 使用时间戳和循环次数作为随机种子，确保每次shuffle都不同
+            #     random.seed(int(time.time()) + rank + cycle_count)
+            #     random.shuffle(assigned_files)
+            #     self.debug_print(f"第{cycle_count + 1}轮循环开始，已重新shuffle文件顺序")
             try:
-                self.debug_print(f"开始流式处理文件 {file_idx + 1}/{len(assigned_files)}: {os.path.basename(file_path)}")
+                # 由于使用无限循环，计算实际文件索引
+                actual_file_idx = file_idx % len(assigned_files)
+                self.debug_print(f"开始流式处理文件 (循环第{file_idx + 1}次, 文件{actual_file_idx + 1}/{len(assigned_files)}): {os.path.basename(file_path)}")
                 
                 user_count = 0
                 total_samples = 0
@@ -265,7 +173,17 @@ class StreamingUserColesIterableDataset(IterableDataset):
                             df = pd.DataFrame(processed_records)
                             
                             # 设置client_id（使用原始user_id或行号）
-                            client_id = user_data.get('user_id', f"{file_idx}_{line_idx}")
+                            # client_id = user_data.get('user_id', f"{file_idx}_{line_idx}")
+                            
+                            # 设置client_id（使用原始user_id或生成全局唯一ID）
+                            # 为避免client_id冲突，使用rank、worker_id、file_idx、line_idx组合生成唯一ID
+                            worker_id = worker_info.id if worker_info is not None else 0
+                            if 'user_id' in user_data and user_data['user_id'] is not None:
+                                # 如果有原始user_id，添加前缀确保唯一性
+                                client_id = f"r{rank}_w{worker_id}_f{actual_file_idx}_{user_data['user_id']}"
+                            else:
+                                # 生成全局唯一的client_id
+                                client_id = f"r{rank}_w{worker_id}_f{actual_file_idx}_l{line_idx}"
                             df['client_id'] = client_id
                             
                             # 将字符串格式的时间字段转换为数值类型
@@ -421,6 +339,123 @@ def load_jsonl_as_dataframe(jsonl_path):
     #     errors='coerce'  # 避免不合法时间导致 crash
     # )
     return df
+
+
+class MultiFileColesIterableDataset(IterableDataset):
+    """改进的多文件可迭代数据集，支持分布式训练和连续数据流
+    
+    这个数据集将多个训练文件整合成一个连续的数据流，避免了重复创建Trainer的开销。
+    支持分布式训练，每个进程处理不同的文件子集。
+    """
+    
+    def __init__(self, file_paths, preprocessor, dataset_builder, debug_print_func=None, max_files=None):
+        """
+        Args:
+            file_paths: 训练文件路径列表
+            preprocessor: 数据预处理器
+            dataset_builder: 数据集构建函数，接收处理后的DataFrame，返回Dataset
+            debug_print_func: 调试打印函数
+            max_files: 最大处理文件数量，None表示处理所有文件
+        """
+        # 限制文件数量
+        if max_files is not None and max_files > 0:
+            self.file_paths = file_paths[:max_files]
+        else:
+            self.file_paths = file_paths
+            
+        self.preprocessor = preprocessor
+        self.dataset_builder = dataset_builder
+        self.debug_print = debug_print_func if debug_print_func else print
+        self.max_files = max_files
+        
+        # 记录数据集信息
+        self._log_dataset_info()
+    
+    @staticmethod
+    def collate_fn(batch):
+        """批处理函数，与ColesDataset保持一致"""
+        from operator import iadd
+        from functools import reduce
+        from ptls.data_load.utils import collate_feature_dict
+        import torch
+        
+        class_labels = [i for i, class_samples in enumerate(batch) for _ in class_samples]
+        batch = reduce(iadd, batch)
+        padded_batch = collate_feature_dict(batch)
+        return padded_batch, torch.LongTensor(class_labels)
+    
+    @rank_zero_only
+    def _log_dataset_info(self):
+        """记录数据集基本信息"""
+        self.debug_print(f"\n=== MultiFileColesIterableDataset 初始化 ===")
+        self.debug_print(f"总文件数: {len(self.file_paths)}")
+        self.debug_print(f"文件列表: {[os.path.basename(f) for f in self.file_paths[:5]]}{'...' if len(self.file_paths) > 5 else ''}")
+        self.debug_print(f"=== 数据集初始化完成 ===\n")
+    
+    def __iter__(self):
+        """迭代器实现，支持分布式训练"""
+        # 获取分布式训练信息
+        rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+        world_size = torch.distributed.get_world_size() if torch.distributed.is_initialized() else 1
+        
+        # 处理文件数量少于进程数的情况：循环分配文件
+        if len(self.file_paths) < world_size:
+            # 通过循环索引确保每个进程都能分配到文件
+            extended_files = []
+            for i in range(world_size):
+                file_idx = i % len(self.file_paths)
+                extended_files.append(self.file_paths[file_idx])
+            file_list = extended_files
+        else:
+            file_list = self.file_paths
+        
+        # 获取worker信息（用于DataLoader多进程）
+        worker_info = get_worker_info()
+        if worker_info is not None:
+            # 在DataLoader多进程环境中
+            worker_id = worker_info.id
+            num_workers = worker_info.num_workers
+            
+            # 先按DDP进程分片，再按worker分片
+            files_per_rank = file_list[rank::world_size]
+            assigned_files = files_per_rank[worker_id::num_workers]
+            
+            self.debug_print(f"Worker {worker_id}/{num_workers} on rank {rank}/{world_size} processing {len(assigned_files)} files")
+        else:
+            # 单进程环境，只按DDP分片
+            assigned_files = file_list[rank::world_size]
+            self.debug_print(f"Rank {rank}/{world_size} processing {len(assigned_files)} files")
+        
+        # 如果当前进程仍然没有分配到文件，记录警告但不阻塞
+        if len(assigned_files) == 0:
+            self.debug_print(f"警告: Rank {rank} 没有分配到文件，将跳过训练")
+            return
+        
+        # 逐文件处理并生成样本
+        for file_idx, file_path in enumerate(assigned_files):
+            try:
+                self.debug_print(f"开始处理文件 {file_idx + 1}/{len(assigned_files)}: {os.path.basename(file_path)}")
+                
+                # 加载和预处理数据
+                df = load_jsonl_as_dataframe_new_format(file_path)
+                processed_data = self.preprocessor.fit_transform(df)
+                
+                # 构建数据集
+                dataset = self.dataset_builder(processed_data)
+                
+                # 生成样本
+                sample_count = 0
+                for sample in dataset:
+                    yield sample
+                    sample_count += 1
+                
+                self.debug_print(f"文件 {os.path.basename(file_path)} 处理完成，生成 {sample_count} 个样本")
+                
+            except Exception as e:
+                self.debug_print(f"处理文件 {file_path} 时出错: {str(e)}")
+                # 继续处理下一个文件，不中断整个训练过程
+                continue
+
 
 
 def load_jsonl_from_directory(directory_path):

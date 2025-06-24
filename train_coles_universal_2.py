@@ -522,7 +522,7 @@ def create_feature_config_for_universal_encoder(config_path='feature_config.json
             debug_print(f"{name}: {config['type']}")
     debug_print("=== 特征配置加载完成 ===\n")
     
-    # print("create_feature_config_for_universal_encoder:",feature_config)
+
     return feature_config
 
 
