@@ -46,7 +46,7 @@ os.environ['OMP_NUM_THREADS'] = '1'
 # 设置日志文件，将调试信息重定向到文件（只在主进程中执行）
 @rank_zero_only
 def setup_logging():
-    log_dir = 'logs_xqy'
+    log_dir = 'logs_pretrain_xqy'
     os.makedirs(log_dir, exist_ok=True)
     log_filename = f"{log_dir}/debug_output_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
     log_file = open(log_filename, 'w', encoding='utf-8')
@@ -335,7 +335,8 @@ class MetricsTracker(Callback):
             plt.savefig(save_path, dpi=300, bbox_inches='tight')
             debug_print(f"指标图表已保存到: {save_path}")
         
-        plt.show()
+        # plt.show()
+        plt.close()
         
         # 打印统计信息
         if self.train_losses:
@@ -526,7 +527,7 @@ def train_continuous_coles_universal(train_dir, val_dir, config):
     # 记录函数开始时间
     function_start_time = print_time_point("=== 训练函数开始 ===")
     
-    output_dir = './output'
+    output_dir = './output_pretrain'
     os.makedirs(output_dir, exist_ok=True)
     
     # 解析配置
@@ -689,7 +690,7 @@ def train_continuous_coles_universal(train_dir, val_dir, config):
     if should_profile:
         debug_print("启用性能监控 - 当前进程将进行性能分析")
         profiler = PyTorchProfiler(
-            on_trace_ready=torch.profiler.tensorboard_trace_handler('./log_xqy/torch_prof_lightning'),
+            on_trace_ready=torch.profiler.tensorboard_trace_handler('./logs_pretrain_xqy/torch_prof_lightning'),
             profile_memory=True,
             record_shapes=True,
             with_stack=True,
@@ -715,7 +716,7 @@ def train_continuous_coles_universal(train_dir, val_dir, config):
         limit_val_batches=10,             # 每次验证只采10个batch
         logger=False,
         enable_model_summary=True,
-        profiler=profiler,
+        # profiler=profiler,
     )
     
     # 开始训练（使用max_steps控制训练步数）
@@ -767,16 +768,16 @@ def train_continuous_coles_universal(train_dir, val_dir, config):
     # 性能监控结果说明
     if should_profile and profiler is not None:
         debug_print("\n=== 性能监控结果 ===")
-        debug_print("性能分析数据已保存到: ./logs/torch_prof_lightning/")
+        debug_print("性能分析数据已保存到: ./logs_pretrain_xqy/torch_prof_lightning/")
         debug_print("查看性能分析结果的方法:")
-        debug_print("1. 启动TensorBoard: tensorboard --logdir=./logs/torch_prof_lightning")
+        debug_print("1. 启动TensorBoard: tensorboard --logdir=./logs_pretrain_xqy/torch_prof_lightning")
         debug_print("2. 在浏览器中打开: http://localhost:6006")
         debug_print("3. 点击 'PROFILE' 标签页查看性能分析")
         debug_print("4. 可以查看CPU/GPU使用率、内存使用、算子耗时等详细信息")
     
     print_time_point("连续训练函数完成", function_start_time)
     
-    return model, metrics_tracker
+    return model, metrics_tracker 
 
 
 if __name__ == '__main__':
@@ -817,7 +818,7 @@ if __name__ == '__main__':
             if metrics_tracker.val_metrics:
                 best_val_metric = max(metrics_tracker.val_metrics)
                 debug_print(f"最佳验证指标: {best_val_metric:.4f}")
-            debug_print(f"所有输出文件保存在: ./output/ 目录")
+            debug_print(f"所有输出文件保存在: ./output_pretrain/ 目录")
         
         # 记录主程序完成时间
         print_time_point("=== 主程序执行完成 ===", main_start_time)
@@ -832,11 +833,12 @@ if __name__ == '__main__':
                 debug_print("你可以使用以下命令查看完整的调试信息:")
                 debug_print(f"cat {log_filename}")
                 debug_print(f"或者使用: less {log_filename}")
-            debug_print("\n损失图表和数据文件已保存到 ./output/ 目录中")
+            debug_print("\n损失图表和数据文件已保存到 ./output_pretrain/ 目录中")
             debug_print("你可以查看生成的PNG图片来分析训练过程")
+            
             sys.stdout = original_stdout
             log_file.close()
         else:
             debug_print(f"\n程序执行完成")
-            debug_print("\n损失图表和数据文件已保存到 ./output/ 目录中")
+            debug_print("\n损失图表和数据文件已保存到 ./output_pretrain/ 目录中")
             debug_print("你可以查看生成的PNG图片来分析训练过程")

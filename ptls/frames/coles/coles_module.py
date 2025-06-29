@@ -49,7 +49,7 @@ class CoLESModule(ABSModule):
 
         if loss is None:
             loss = ContrastiveLoss(margin=0.5,
-                                   sampling_strategy=HardNegativePairSelector(neg_count=5))
+                                   sampling_strategy=HardNegativePairSelector(neg_count=2))
 
         if validation_metric is None:
             validation_metric = BatchRecallTopK(K=2, metric='cosine')

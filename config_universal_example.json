@@ -16,6 +16,18 @@
         "batch_size": 20,
         "learning_rate": 1e-3
     },
+    "finetune_config": {
+        "finetune_epochs": 10,
+        "learning_rate": 1e-4,
+        "weight_decay": 1e-5,
+        "mlp_hidden_dims": [384],
+        "mlp_dropout": 0.2,
+        "freeze_encoder": false,
+        "freeze_epochs": 0,
+        "optimizer_type": "adam",
+        "scheduler_type": null,
+        "label_smoothing": 0.0
+    },
     "universal_encoder_config": {
         "emb_dim_cfg": {
             "交易渠道": 16,
