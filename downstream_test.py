@@ -85,6 +85,7 @@ def main():
         dataset_builder=build_dataset_from_df,
         debug_print_func=debug_print,
         shuffle_files=False,
+        num_classes=2,  # 二分类任务
     )
     from torch.utils.data import DataLoader
     test_loader = DataLoader(

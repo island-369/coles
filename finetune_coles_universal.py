@@ -92,6 +92,7 @@ def main():
         dataset_builder=build_dataset_from_df,
         debug_print_func=debug_print,
         shuffle_files=True,
+        num_classes=2,  # 二分类任务
     )
     val_ds = DownstreamBinaryClassificationDataset(
         data_root=val_path,
@@ -99,6 +100,7 @@ def main():
         dataset_builder=build_dataset_from_df,
         debug_print_func=debug_print,
         shuffle_files=False,
+        num_classes=2,  # 二分类任务
     )
     from torch.utils.data import DataLoader
     train_loader = DataLoader(
