@@ -7,3 +7,4 @@ logs_finetune
 logs_pretrain_xqy
 output_pretrain
 checkpoints
+output_finetune

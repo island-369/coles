@@ -25,7 +25,7 @@ from ptls.frames.coles.split_strategy import NoSplit
 
 # 2. 下游相关
 from downstream_finetune_model import create_finetune_model
-from downstream_data_loader import DownstreamTestDataset
+from downstream_data_loader import DistributedValTestDataset
 
 # 3. 日志
 def setup_logging():
@@ -79,12 +79,12 @@ def main():
         )
 
     # ---- 数据集/Loader ----
-    test_ds = DownstreamTestDataset(
+    # 使用全局分片的DistributedValTestDataset，避免多进程数据不均衡问题
+    test_ds = DistributedValTestDataset(
         data_root=test_path,
         preprocessor=preprocessor,
         dataset_builder=build_dataset_from_df,
         debug_print_func=debug_print,
-        shuffle_files=False,
         num_classes=2,  # 二分类任务
     )
     from torch.utils.data import DataLoader
@@ -92,7 +92,7 @@ def main():
         test_ds,
         batch_size=batch_size,
         num_workers=1,
-        collate_fn=DownstreamTestDataset.collate_fn
+        collate_fn=DistributedValTestDataset.collate_fn
     )
 
     # ---- 构建模型（结构参数全部与训练一致） ----

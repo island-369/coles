@@ -106,16 +106,18 @@ class CoLESFinetuneModule(pl.LightningModule):
                  optimizer_type: str = 'adam',
                  scheduler_type: Optional[str] = None,
                  class_weights: Optional[torch.Tensor] = None,
-                 label_smoothing: float = 0.0):
+                 label_smoothing: float = 0.0,
+                 debug_print_func=None):
         super().__init__()
         
         # 保存超参数（排除seq_encoder避免序列化问题）
-        self.save_hyperparameters(ignore=["seq_encoder", "class_weights"])
+        self.save_hyperparameters(ignore=["seq_encoder", "class_weights", "debug_print_func"])
         
         self.seq_encoder = seq_encoder
         self.n_classes = n_classes
         self.freeze_epochs = freeze_epochs
         self.current_epoch_count = 0
+        self.debug_print = debug_print_func if debug_print_func else print
         
         # 获取编码器输出维度
         if hasattr(seq_encoder, 'embedding_size'):
@@ -203,8 +205,8 @@ class CoLESFinetuneModule(pl.LightningModule):
         acc = (preds == y).float().mean()
         
         # 记录指标
-        self.log('train_loss', loss, on_step=True, on_epoch=True, prog_bar=True)
-        self.log('train_acc', acc, on_step=True, on_epoch=True, prog_bar=True)
+        self.log('train_loss', loss, on_step=True, on_epoch=True, prog_bar=True,sync_dist=True)
+        self.log('train_acc', acc, on_step=True, on_epoch=True, prog_bar=True,sync_dist=True)
         
         return loss
         
@@ -233,6 +235,9 @@ class CoLESFinetuneModule(pl.LightningModule):
         if not self.validation_step_outputs:
             return
             
+        # 获取当前步数
+        current_step = self.global_step
+        
         # 收集所有预测结果
         all_preds = torch.cat([x['preds'] for x in self.validation_step_outputs])
         all_targets = torch.cat([x['targets'] for x in self.validation_step_outputs])
@@ -249,24 +254,35 @@ class CoLESFinetuneModule(pl.LightningModule):
         f1 = f1_score(all_targets.cpu().numpy(), all_preds.cpu().numpy(), average='weighted')
         
         # 计算AUC（仅对二分类）
+        auc_value = 0.5  # 默认值
         if self.n_classes == 2:
             try:
                 # 检查是否有多个类别
                 unique_targets = torch.unique(all_targets)
                 if len(unique_targets) > 1:
-                    auc = roc_auc_score(all_targets.cpu().numpy(), all_probs[:, 1].cpu().numpy())
-                    self.log('val_auc', auc, prog_bar=True, sync_dist=True)
+                    auc_value = roc_auc_score(all_targets.cpu().numpy(), all_probs[:, 1].cpu().numpy())
+                    self.log('val_auc', auc_value, prog_bar=True, sync_dist=True)
                 else:
-                    print(f"Warning: Only one class present in validation set: {unique_targets.tolist()}")
-                    self.log('val_auc', 0.5, prog_bar=True, sync_dist=True)  # 默认值
+                    self.debug_print(f"Warning: Only one class present in validation set: {unique_targets.tolist()}")
+                    self.log('val_auc', auc_value, prog_bar=True, sync_dist=True)  # 默认值
             except Exception as e:
-                print(f"Error calculating AUC: {e}")
-                self.log('val_auc', 0.5, prog_bar=True, sync_dist=True)  # 默认值
+                self.debug_print(f"Error calculating AUC: {e}")
+                self.log('val_auc', auc_value, prog_bar=True, sync_dist=True)  # 默认值
             
         # 记录指标
         self.log('val_loss', avg_loss, prog_bar=True, sync_dist=True)
         self.log('val_acc', acc, prog_bar=True, sync_dist=True)
         self.log('val_f1', f1, prog_bar=True, sync_dist=True)
+        
+        # 输出验证指标到日志
+        self.debug_print(f"\n=== 验证指标 (Step {current_step}) ===")
+        self.debug_print(f"验证损失 (val_loss): {avg_loss:.6f}")
+        self.debug_print(f"验证准确率 (val_acc): {acc:.6f}")
+        self.debug_print(f"验证F1分数 (val_f1): {f1:.6f}")
+        if self.n_classes == 2:
+            self.debug_print(f"验证AUC (val_auc): {auc_value:.6f}")
+        self.debug_print(f"验证样本数量: {len(all_targets)}")
+        self.debug_print(f"=== 验证完成 ===\n")
         
         # 清空输出
         self.validation_step_outputs.clear()

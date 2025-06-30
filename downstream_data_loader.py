@@ -143,11 +143,15 @@ class DownstreamBinaryClassificationDataset(IterableDataset):
             files_per_rank = file_list[rank::world_size]
             assigned_files = files_per_rank[worker_id::num_workers]
             
-            self.debug_print(f"Worker {worker_id}/{num_workers} on rank {rank}/{world_size} processing {len(assigned_files)} files")
+            self.debug_print(f"\n=== 训练数据加载开始 ===")
+            self.debug_print(f"分布式信息: rank={rank}/{world_size}, worker={worker_id}/{num_workers}")
+            self.debug_print(f"分配文件: {len(assigned_files)} 个文件")
         else:
             # 单进程环境，只按DDP分片
             assigned_files = file_list[rank::world_size]
-            self.debug_print(f"Rank {rank}/{world_size} processing {len(assigned_files)} files")
+            self.debug_print(f"\n=== 训练数据加载开始 ===")
+            self.debug_print(f"分布式信息: rank={rank}/{world_size}, 单进程模式")
+            self.debug_print(f"分配文件: {len(assigned_files)} 个文件")
         
         # 如果当前进程仍然没有分配到文件，记录警告但不阻塞
         if len(assigned_files) == 0:
@@ -263,11 +267,227 @@ class DownstreamBinaryClassificationDataset(IterableDataset):
         return len(self.file_list)
 
 
+class DistributedValTestDataset(IterableDataset):
+    """
+    分布式验证/测试数据集：多进程/多worker共享同一文件列表，
+    按(rank*num_workers+worker_id)对行号全局分片，每人处理自己的那部分，保证不重复、不遗漏。
+    
+    特点：
+    - 所有进程/worker共享完整文件列表
+    - 通过全局分片方式分配数据行，而非文件级分配
+    - 单次遍历，不循环读取
+    - 避免多进程间数据不均衡导致的提前结束问题
+    """
+    
+    def __init__(self, data_root, preprocessor, dataset_builder, debug_print_func=None, num_classes=2):
+        """
+        Args:
+            data_root: 数据根目录路径
+            preprocessor: 数据预处理器
+            dataset_builder: 数据集构建函数，接收处理后的DataFrame，返回Dataset
+            debug_print_func: 调试打印函数
+            num_classes: 类别数量，默认为2（二分类）
+        """
+        self.data_root = data_root
+        self.preprocessor = preprocessor
+        self.dataset_builder = dataset_builder
+        self.debug_print = debug_print_func if debug_print_func else print
+        self.num_classes = num_classes
+        
+        # 定义交易字段名称和顺序（与训练时保持一致）
+        self.trx_field_names = [
+            '发卡机构地址', '发卡机构银行', '卡等级', 'year', 'month', 'day',
+            'hour', 'minutes', 'seconds', 'unix_timestamp', '收单机构地址',
+            '收单机构银行', 'cups_交易代码', '交易渠道', 'cups_服务点输入方式',
+            'cups_应答码', 'cups_商户类型', 'cups_连接方式', 'cups_受卡方名称地址',
+            '交易金额'
+        ]
+        
+        # 扫描数据目录，构建完整文件列表（所有进程共享）
+        self.file_list = []
+        self._scan_data_directory()
+        
+        # 记录数据集信息
+        self._log_dataset_info()
+    
+    def _scan_data_directory(self):
+        """扫描数据目录，构建文件列表"""
+        if not os.path.exists(self.data_root):
+            raise ValueError(f"数据根目录不存在: {self.data_root}")
+        
+        # 扫描根目录下的所有jsonl文件，并排序确保一致性
+        for filename in sorted(os.listdir(self.data_root)):
+            if filename.endswith('.jsonl'):
+                file_path = os.path.join(self.data_root, filename)
+                self.file_list.append(file_path)
+        
+        if len(self.file_list) == 0:
+            raise ValueError(f"在数据目录中未找到任何jsonl文件: {self.data_root}")
+    
+    @rank_zero_only
+    def _log_dataset_info(self):
+        """记录数据集基本信息"""
+        self.debug_print(f"\n=== DistributedValTestDataset 初始化 ===")
+        self.debug_print(f"数据根目录: {self.data_root}")
+        self.debug_print(f"类别数量: {self.num_classes}")
+        self.debug_print(f"总文件数: {len(self.file_list)}")
+        self.debug_print(f"处理模式: 全局分片读取，单次遍历，多进程共享文件列表")
+        self.debug_print(f"=== 数据集初始化完成 ===\n")
+    
+    @staticmethod
+    def collate_fn(batch):
+        """批处理函数，适配二分类任务"""
+        from ptls.data_load.utils import collate_feature_dict
+        import torch
+        
+        # 分离样本和标签，并处理ColesDataset返回的splits列表
+        all_samples = []
+        all_labels = []
+        
+        for item in batch:
+            splits, label = item[0], item[1]
+            # ColesDataset返回的是splits列表，需要展平
+            if isinstance(splits, list):
+                for split in splits:
+                    all_samples.append(split)
+                    all_labels.append(label)
+            else:
+                all_samples.append(splits)
+                all_labels.append(label)
+        
+        # 处理特征数据
+        padded_batch = collate_feature_dict(all_samples)
+        
+        # 返回特征和标签
+        return padded_batch, torch.LongTensor(all_labels)
+    
+    def get_num_classes(self):
+        """获取类别数量"""
+        return self.num_classes
+    
+    def get_file_count(self):
+        """获取文件数量"""
+        return len(self.file_list)
+    
+    def __iter__(self):
+        """迭代器实现，全局分片读取，单次遍历"""
+        # 获取分布式训练信息
+        rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+        world_size = torch.distributed.get_world_size() if torch.distributed.is_initialized() else 1
+        
+        # 获取worker信息（用于DataLoader多进程）
+        worker_info = get_worker_info()
+        if worker_info is not None:
+            worker_id = worker_info.id
+            num_workers = worker_info.num_workers
+        else:
+            worker_id, num_workers = 0, 1
+        
+        # 计算全局worker信息
+        total_workers = world_size * num_workers
+        global_worker_id = rank * num_workers + worker_id
+        
+        self.debug_print(f"\n=== Val/Test数据加载开始 ===")
+        self.debug_print(f"分布式信息: rank={rank}/{world_size}, worker={worker_id}/{num_workers}")
+        self.debug_print(f"全局worker信息: total_workers={total_workers}, global_worker_id={global_worker_id}")
+        self.debug_print(f"文件列表: {len(self.file_list)} 个文件")
+        self.debug_print(f"=== 开始处理数据 ===")
+        
+        # 遍历所有文件（所有进程共享同一文件列表）
+        for fidx, file_path in enumerate(self.file_list):
+            self.debug_print(f"Val/Test: opening file {os.path.basename(file_path)} ({fidx+1}/{len(self.file_list)})")
+            
+            try:
+                user_count = 0
+                total_samples = 0
+                
+                with open(file_path, "r", encoding="utf-8") as f:
+                    for line_idx, line in enumerate(f):
+                        # 全局分片——每行只给一个rank/worker
+                        if (line_idx % total_workers) != global_worker_id:
+                            continue
+                        
+                        try:
+                            # 解析用户数据
+                            user_data = json.loads(line)
+                            
+                            # 必须含label和trans
+                            if 'label' not in user_data or 'trans' not in user_data:
+                                continue
+                            
+                            label_id = int(user_data['label'])
+                            records = user_data['trans']
+                            if not records:
+                                continue
+                            
+                            # 检查并处理列数不匹配的情况
+                            processed_records = []
+                            for trx_array in records:
+                                if isinstance(trx_array, list) and len(trx_array) >= len(self.trx_field_names):
+                                    trx_dict = {fn: trx_array[i] for i, fn in enumerate(self.trx_field_names)}
+                                    processed_records.append(trx_dict)
+                            
+                            if not processed_records:
+                                continue
+                            
+                            # 转换为DataFrame
+                            df = pd.DataFrame(processed_records)
+                            
+                            # 设置client_id（全局唯一）
+                            if 'user_id' in user_data and user_data['user_id'] is not None:
+                                client_id = f"gwi{global_worker_id}_f{fidx}_{user_data['user_id']}"
+                            else:
+                                client_id = f"gwi{global_worker_id}_f{fidx}_l{line_idx}"
+                            df['client_id'] = client_id
+                            
+                            # 将字符串格式的时间字段转换为数值类型
+                            for col in ['year', 'month', 'day', 'hour', 'minutes', 'seconds']:
+                                if col in df.columns:
+                                    df[col] = pd.to_numeric(df[col], errors='coerce')
+                            
+                            # 预处理单个用户的数据
+                            processed = self.preprocessor.fit_transform(df)
+                            
+                            # 构建数据集并生成样本
+                            dataset = self.dataset_builder(processed)
+                            
+                            user_sample_count = 0
+                            for sample in dataset:
+                                yield (sample, label_id)
+                                user_sample_count += 1
+                            
+                            user_count += 1
+                            total_samples += user_sample_count
+                            
+                            # 每处理1000个用户打印一次进度
+                            if user_count % 1000 == 0:
+                                self.debug_print(f"Val/Test文件 {os.path.basename(file_path)}: 已处理 {user_count} 个用户，生成 {total_samples} 个样本")
+                        
+                        except json.JSONDecodeError as e:
+                            self.debug_print(f"Val/Test: JSON解析错误，跳过行 {line_idx}: {str(e)}")
+                            continue
+                        except Exception as e:
+                            self.debug_print(f"Val/Test: 处理用户数据时出错，跳过行 {line_idx}: {str(e)}")
+                            continue
+                
+                self.debug_print(f"Val/Test文件 {os.path.basename(file_path)} 处理完成，处理了 {user_count} 个用户，生成 {total_samples} 个样本")
+                
+            except Exception as e:
+                self.debug_print(f"Val/Test: 处理文件 {file_path} 时出错: {str(e)}")
+                continue
+        
+        self.debug_print(f"\n=== Val/Test数据加载完成 ===")
+        self.debug_print(f"Global worker {global_worker_id} 已完成所有文件的处理")
+        self.debug_print(f"=== 数据加载结束 ===\n")
+
+
 class DownstreamTestDataset(DownstreamBinaryClassificationDataset):
     """用于下游任务测试的数据集
     
     继承自DownstreamBinaryClassificationDataset，但不使用无限循环，
     适合测试和验证阶段使用。
+    
+    注意：此类已被DistributedValTestDataset替代，建议使用新类以获得更好的分布式支持。
     """
     
     def __iter__(self):

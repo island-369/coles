@@ -23,7 +23,7 @@ from ptls.frames.coles.split_strategy import NoSplit
 
 # 2. 下游模型和数据集导入
 from downstream_finetune_model import create_finetune_model
-from downstream_data_loader import DownstreamBinaryClassificationDataset
+from downstream_data_loader import DownstreamBinaryClassificationDataset, DistributedValTestDataset
 
 # 3. 日志设置
 def setup_logging():
@@ -86,6 +86,7 @@ def main():
         )
 
     # ---- 数据集/数据加载器（与预训练同风格，使用你自己的下游数据集类） ----
+    # 训练集使用无限循环的DownstreamBinaryClassificationDataset
     train_ds = DownstreamBinaryClassificationDataset(
         data_root=train_path,
         preprocessor=preprocessor,
@@ -94,12 +95,12 @@ def main():
         shuffle_files=True,
         num_classes=2,  # 二分类任务
     )
-    val_ds = DownstreamBinaryClassificationDataset(
+    # 验证集使用全局分片的DistributedValTestDataset，避免多进程数据不均衡问题
+    val_ds = DistributedValTestDataset(
         data_root=val_path,
         preprocessor=preprocessor,
         dataset_builder=build_dataset_from_df,
         debug_print_func=debug_print,
-        shuffle_files=False,
         num_classes=2,  # 二分类任务
     )
     from torch.utils.data import DataLoader
@@ -113,11 +114,11 @@ def main():
         val_ds,
         batch_size=batch_size,
         num_workers=1,
-        collate_fn=DownstreamBinaryClassificationDataset.collate_fn
+        collate_fn=DistributedValTestDataset.collate_fn
     )
 
     # ---- 构建和加载模型（与预训练代码中保持一致） ----
-    from train_coles_universal import UniversalTrxEncoder  # 直接用已实现的
+    from universal_trx_encoder import UniversalTrxEncoder  # 使用独立模块避免日志冲突
     
     trx_encoder = UniversalTrxEncoder(
         feature_config=feature_config,
@@ -125,7 +126,8 @@ def main():
         num_fbr_cfg=num_fbr_cfg,
         feature_fusion=feature_fusion,
         linear_projection_size=model_dim,
-        embeddings_noise=0.0  # 下游一般不要噪声
+        embeddings_noise=0.0,  # 下游一般不要噪声
+        debug_print_func=debug_print
     )
     seq_encoder = TransformerSeqEncoder(
         trx_encoder=trx_encoder,
@@ -152,6 +154,7 @@ def main():
         optimizer_type=finetune_config.get('optimizer_type', 'adam'),
         scheduler_type=finetune_config.get('scheduler_type', None),
         label_smoothing=finetune_config.get('label_smoothing', 0.0),
+        debug_print_func=debug_print,
     )
 
     # ---- 加载预训练pt文件 ----
