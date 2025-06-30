@@ -255,18 +255,18 @@ class CoLESFinetuneModule(pl.LightningModule):
                 unique_targets = torch.unique(all_targets)
                 if len(unique_targets) > 1:
                     auc = roc_auc_score(all_targets.cpu().numpy(), all_probs[:, 1].cpu().numpy())
-                    self.log('val_auc', auc, prog_bar=True)
+                    self.log('val_auc', auc, prog_bar=True, sync_dist=True)
                 else:
                     print(f"Warning: Only one class present in validation set: {unique_targets.tolist()}")
-                    self.log('val_auc', 0.5, prog_bar=True)  # 默认值
+                    self.log('val_auc', 0.5, prog_bar=True, sync_dist=True)  # 默认值
             except Exception as e:
                 print(f"Error calculating AUC: {e}")
-                self.log('val_auc', 0.5, prog_bar=True)  # 默认值
+                self.log('val_auc', 0.5, prog_bar=True, sync_dist=True)  # 默认值
             
         # 记录指标
-        self.log('val_loss', avg_loss, prog_bar=True)
-        self.log('val_acc', acc, prog_bar=True)
-        self.log('val_f1', f1, prog_bar=True)
+        self.log('val_loss', avg_loss, prog_bar=True, sync_dist=True)
+        self.log('val_acc', acc, prog_bar=True, sync_dist=True)
+        self.log('val_f1', f1, prog_bar=True, sync_dist=True)
         
         # 清空输出
         self.validation_step_outputs.clear()
@@ -342,26 +342,24 @@ class CoLESFinetuneModule(pl.LightningModule):
         else:
             state_dict = checkpoint
             
-        # 过滤出编码器相关的参数
-        encoder_state_dict = {}
-        for key, value in state_dict.items():
-            if key.startswith('seq_encoder.') or key.startswith('trx_encoder.'):
-                # 移除前缀以匹配当前模型结构
-                new_key = key
-                if key.startswith('seq_encoder.'):
-                    new_key = key[len('seq_encoder.'):]
-                encoder_state_dict[new_key] = value
+        # 只取出主干seq_encoder部分，去掉"_seq_encoder."前缀
+        encoder_dict = {}
+        for k, v in state_dict.items():
+            if k.startswith('_seq_encoder.'):
+                new_k = k[len('_seq_encoder.'):]
+                encoder_dict[new_k] = v
+            # 如果有历史其它prefix，也可加
+            elif k.startswith('seq_encoder.'):
+                new_k = k[len('seq_encoder.'):]
+                encoder_dict[new_k] = v
                 
         # 加载权重
         missing_keys, unexpected_keys = self.seq_encoder.load_state_dict(
-            encoder_state_dict, strict=strict
+            encoder_dict, strict=strict
         )
         
-        if missing_keys:
-            print(f"Missing keys: {missing_keys}")
-        if unexpected_keys:
-            print(f"Unexpected keys: {unexpected_keys}")
-            
+        print(f"[INFO] missing keys: {missing_keys}")
+        print(f"[INFO] unexpected keys: {unexpected_keys}")
         print(f"Successfully loaded pretrained encoder from {checkpoint_path}")
         
     def get_embeddings(self, dataloader):

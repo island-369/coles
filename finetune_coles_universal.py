@@ -155,7 +155,7 @@ def main():
     )
 
     # ---- 加载预训练pt文件 ----
-    pretrained_ckpt = "./output_pretrain/continuous_coles_model.ckpt"
+    pretrained_ckpt = finetune_config.get('pretrained_ckpt', './output_pretrain/continuous_coles_model.ckpt')
     debug_print(f"加载预训练权重: {pretrained_ckpt}")
     downstream_model.load_pretrained_encoder(
         checkpoint_path=pretrained_ckpt,
@@ -163,16 +163,25 @@ def main():
     )
     debug_print("预训练权重加载完毕")
 
-    # ---- Lightning Trainer，保持与预训练同风格 ----
+    # ---- Lightning Trainer，基于max_steps训练 ----
     pl.seed_everything(42)
+    
+    # 基于步数的训练配置
+    max_steps = finetune_config.get('max_steps', 10000)  # 默认10000步
+    val_check_interval = finetune_config.get('val_check_interval', 500)  # 每500步验证一次
+    
+    debug_print(f"使用基于步数的训练: max_steps={max_steps}, val_check_interval={val_check_interval}")
+    
     trainer = pl.Trainer(
-        max_epochs=finetune_config.get('finetune_epochs', 10),
+        max_steps=max_steps,
         accelerator='gpu' if torch.cuda.is_available() else 'cpu',
-        devices=1,
+        devices=2,
+        strategy='ddp',
+        enable_checkpointing=True,
         logger=False,
         enable_progress_bar=True,
-        check_val_every_n_epoch=1,
-        val_check_interval=None,   # 按epoch
+        val_check_interval=val_check_interval,
+        enable_model_summary=True,
     )
 
     debug_print("开始下游Finetune训练...")

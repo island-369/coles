@@ -154,10 +154,15 @@ class DownstreamBinaryClassificationDataset(IterableDataset):
             self.debug_print(f"警告: Rank {rank} 没有分配到文件，将跳过训练")
             return
         
-        # 处理分配到的文件
-        for file_idx, file_path in enumerate(assigned_files):
+        # 使用itertools.cycle无限循环assigned_files，避免分布式训练死锁
+        self.debug_print(f"开始无限循环处理文件，避免分布式训练死锁")
+        
+        # 无限循环处理文件
+        for file_idx, file_path in enumerate(itertools.cycle(assigned_files)):
             try:
-                self.debug_print(f"开始处理文件 ({file_idx + 1}/{len(assigned_files)}): {os.path.basename(file_path)}")
+                # 由于使用无限循环，计算实际文件索引
+                actual_file_idx = file_idx % len(assigned_files)
+                self.debug_print(f"开始流式处理文件 (循环第{file_idx + 1}次, 文件{actual_file_idx + 1}/{len(assigned_files)}): {os.path.basename(file_path)}")
                 
                 user_count = 0
                 total_samples = 0
@@ -204,10 +209,10 @@ class DownstreamBinaryClassificationDataset(IterableDataset):
                             worker_id = worker_info.id if worker_info is not None else 0
                             if 'user_id' in user_data and user_data['user_id'] is not None:
                                 # 如果有原始user_id，添加前缀确保唯一性
-                                client_id = f"r{rank}_w{worker_id}_f{file_idx}_{user_data['user_id']}"
+                                client_id = f"r{rank}_w{worker_id}_f{actual_file_idx}_{user_data['user_id']}"
                             else:
                                 # 生成全局唯一的client_id
-                                client_id = f"r{rank}_w{worker_id}_f{file_idx}_l{line_idx}"
+                                client_id = f"r{rank}_w{worker_id}_f{actual_file_idx}_l{line_idx}"
                             df['client_id'] = client_id
                             
                             # 将字符串格式的时间字段转换为数值类型

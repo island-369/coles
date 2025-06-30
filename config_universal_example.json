@@ -17,7 +17,8 @@
         "learning_rate": 1e-3
     },
     "finetune_config": {
-        "finetune_epochs": 10,
+        "max_steps": 100,
+        "val_check_interval": 20,
         "learning_rate": 1e-4,
         "weight_decay": 1e-5,
         "mlp_hidden_dims": [384],
@@ -26,7 +27,8 @@
         "freeze_epochs": 0,
         "optimizer_type": "adam",
         "scheduler_type": null,
-        "label_smoothing": 0.0
+        "label_smoothing": 0.0,
+        "pretrained_ckpt": "./checkpoints/epoch=0-step=60.ckpt"
     },
     "universal_encoder_config": {
         "emb_dim_cfg": {
