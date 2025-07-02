@@ -1,0 +1,7 @@
+交易数大于等于2的用户统计（每文件/合计）：
+
+train copy 2.jsonl	15
+train copy 3.jsonl	15
+train copy 4.jsonl	15
+
+所有文件总用户数（交易数≥2）：45
