@@ -15,7 +15,7 @@ import torch.nn.functional as F
 import pytorch_lightning as pl
 from torch.optim import Adam, AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR, ReduceLROnPlateau
-from sklearn.metrics import accuracy_score, roc_auc_score, f1_score
+from sklearn.metrics import accuracy_score, roc_auc_score, f1_score, recall_score, precision_score
 import numpy as np
 from typing import Optional, Dict, Any
 
@@ -253,6 +253,11 @@ class CoLESFinetuneModule(pl.LightningModule):
         # 计算F1分数
         f1 = f1_score(all_targets.cpu().numpy(), all_preds.cpu().numpy(), average='weighted')
         
+        # 计算Recall和Precision
+        recall = recall_score(all_targets.cpu().numpy(), all_preds.cpu().numpy(), average='binary')
+        
+        precision = precision_score(all_targets.cpu().numpy(), all_preds.cpu().numpy(), average='binary')
+        
         # 计算AUC（仅对二分类）
         auc_value = 0.5  # 默认值
         if self.n_classes == 2:
@@ -273,12 +278,16 @@ class CoLESFinetuneModule(pl.LightningModule):
         self.log('val_loss', avg_loss, prog_bar=True, sync_dist=True)
         self.log('val_acc', acc, prog_bar=True, sync_dist=True)
         self.log('val_f1', f1, prog_bar=True, sync_dist=True)
+        self.log('val_recall', recall, prog_bar=True, sync_dist=True)
+        self.log('val_precision', precision, prog_bar=True, sync_dist=True)
         
         # 输出验证指标到日志
         self.debug_print(f"\n=== 验证指标 (Step {current_step}) ===")
         self.debug_print(f"验证损失 (val_loss): {avg_loss:.6f}")
         self.debug_print(f"验证准确率 (val_acc): {acc:.6f}")
         self.debug_print(f"验证F1分数 (val_f1): {f1:.6f}")
+        self.debug_print(f"验证召回率 (val_recall): {recall:.6f}")
+        self.debug_print(f"验证精确率 (val_precision): {precision:.6f}")
         if self.n_classes == 2:
             self.debug_print(f"验证AUC (val_auc): {auc_value:.6f}")
         self.debug_print(f"验证样本数量: {len(all_targets)}")

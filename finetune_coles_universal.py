@@ -81,7 +81,8 @@ def main():
     # ---- 定义从 DF 到 ColesDataset 的转换 ----
     def build_dataset_from_df(df):
         return ColesDataset(
-            MemoryMapDataset(data=df, i_filters=[SeqLenFilter(min_seq_len=1)]),
+            MemoryMapDataset(data=df, i_filters=[SeqLenFilter(min_seq_len=1,max_seq_len=5000)]),
+            
             splitter=NoSplit(),   # 下游任务使用NoSplit，保持完整序列
         )
 
@@ -175,6 +176,16 @@ def main():
     
     debug_print(f"使用基于步数的训练: max_steps={max_steps}, val_check_interval={val_check_interval}")
     
+    checkpoint_callback = ModelCheckpoint(
+        dirpath="./output_finetune/checkpoints",
+        filename="finetune-step{step:06d}-recall{val_recall:.4f}",  # 文件名可含step
+        monitor="val_loss",                            # 按验证集指标保留
+        mode="min",
+        save_top_k=3,                                  # 最多保留3个最佳
+        save_last=True                                 # 总保留最后一次
+    )
+    
+    
     trainer = pl.Trainer(
         max_steps=max_steps,
         accelerator='gpu' if torch.cuda.is_available() else 'cpu',
@@ -185,10 +196,19 @@ def main():
         enable_progress_bar=True,
         val_check_interval=val_check_interval,
         enable_model_summary=True,
+        accumulate_grad_batches=4,           # <- 比如累积4个batch
     )
 
     debug_print("开始下游Finetune训练...")
-    trainer.fit(downstream_model, train_loader, val_loader)
+    
+    ckpt_last = './output_finetune/finetuned_downstream.ckpt' 
+    
+    
+    trainer.validate(downstream_model,val_loader)
+    
+    trainer.fit(downstream_model, train_loader, val_loader， ckpt_path=ckpt_last)
+    
+    trainer.validate(downstream_model,val_loader)
 
     # ---- 保存下游模型 ----
     output_dir = './output_finetune'

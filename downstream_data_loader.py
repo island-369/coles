@@ -190,6 +190,11 @@ class DownstreamBinaryClassificationDataset(IterableDataset):
                             if not records:
                                 continue
                             
+                            # ==== 限制最多512条 ====
+                            if len(records) > 512:
+                                records = records[:512]
+                                
+                                
                             # 检查并处理列数不匹配的情况
                             processed_records = []
                             for trx_array in records:
@@ -419,6 +424,10 @@ class DistributedValTestDataset(IterableDataset):
                             records = user_data['trans']
                             if not records:
                                 continue
+
+                            # ==== 限制最多512条 ====
+                            if len(records) > 512:
+                                records = records[:512]
                             
                             # 检查并处理列数不匹配的情况
                             processed_records = []
@@ -541,6 +550,11 @@ class DownstreamTestDataset(DownstreamBinaryClassificationDataset):
                             if not records:
                                 continue
                             
+                            
+                            # ==== 限制最多512条 ====
+                            if len(records) > 512:
+                                records = records[:512]
+                                
                             # 检查并处理列数不匹配的情况
                             processed_records = []
                             for trx_array in records:

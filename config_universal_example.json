@@ -23,7 +23,7 @@
         "weight_decay": 1e-5,
         "mlp_hidden_dims": [384],
         "mlp_dropout": 0.2,
-        "freeze_encoder": false,
+        "freeze_encoder": true,
         "freeze_epochs": 0,
         "optimizer_type": "adam",
         "scheduler_type": null,

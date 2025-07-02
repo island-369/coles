@@ -31,6 +31,7 @@ class PositionalEncoding(nn.Module):
     def forward(self, x):
         T = x.size(1)
         if self.training and self.use_start_random_shift:
+            # print(f"{self.max_len},{T}")
             start_pos = random.randint(0, self.max_len - T)
         else:
             start_pos = 0
