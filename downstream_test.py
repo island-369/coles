@@ -42,6 +42,13 @@ def debug_print(*args, **kwargs):
         print(*args, file=log_file, **kwargs)
         log_file.flush()
 
+def build_dataset_from_df(df):
+    return ColesDataset(
+        MemoryMapDataset(data=df, i_filters=[SeqLenFilter(min_seq_len=1)]),
+        splitter=NoSplit(),
+    )
+
+
 def main():
     config = init_config()
     model_config = config['model_config']
@@ -72,11 +79,7 @@ def main():
         cols_numerical=['交易金额'],
         return_records=True,
     )
-    def build_dataset_from_df(df):
-        return ColesDataset(
-            MemoryMapDataset(data=df, i_filters=[SeqLenFilter(min_seq_len=1)]),
-            splitter=NoSplit(),
-        )
+
 
     # ---- 数据集/Loader ----
     # 使用全局分片的DistributedValTestDataset，避免多进程数据不均衡问题
@@ -143,10 +146,16 @@ def main():
     debug_print("开始处理测试数据...")
     print("开始处理测试数据...")
     
+    # 用于保存cert_sm3信息
+    all_cert_sm3 = []
+    
     with torch.no_grad():
         batch_iter = tqdm(test_loader, desc="Testing", unit="batch")
         for i_batch, batch in enumerate(batch_iter, 1):
-            x, y = batch
+
+            x, y, cert_sm3_list = batch
+            all_cert_sm3.extend(cert_sm3_list)
+
             x = x.to(device)
             logits = downstream_model(x)
             probs = torch.softmax(logits, dim=-1)
@@ -190,6 +199,30 @@ def main():
     np.save(os.path.join(output_dir, 'test_pred.npy'), y_pred)
     np.save(os.path.join(output_dir, 'test_true.npy'), y_true)
     np.save(os.path.join(output_dir, 'test_prob.npy'), y_prob)
+    
+    # ---- 保存详细的黑盒测试结果 ----
+    # 保存每条数据的cert_sm3、预测标签和对应预测类别的概率
+    detailed_results = []
+    for i in range(len(y_true)):
+        pred = int(y_pred[i])
+        prob = float(y_prob[i, pred])  # 预测为哪一类就取哪一类的概率
+        result_item = {
+            'cert_sm3': all_cert_sm3[i] if i < len(all_cert_sm3) else '',
+            'predicted_label': pred,
+            'predicted_prob': prob
+        }
+        detailed_results.append(result_item)
+    
+    # 保存为JSONL格式，便于后续分析
+    detailed_results_path = os.path.join(output_dir, 'detailed_test_results.jsonl')
+    with open(detailed_results_path, 'w', encoding='utf-8') as f:
+        for result in detailed_results:
+            f.write(json.dumps(result, ensure_ascii=False) + '\n')
+    
+    debug_print(f"详细测试结果已保存到: {detailed_results_path}")
+    debug_print(f"包含 {len(detailed_results)} 条记录，每条包含: cert_sm3, predicted_label, predicted_prob")
+    print(f"详细测试结果已保存到: {detailed_results_path}")
+    print(f"包含 {len(detailed_results)} 条记录")
 
     # 计算指标
     accuracy = accuracy_score(y_true, y_pred)
@@ -204,7 +237,8 @@ def main():
         'model_weight': os.path.abspath(finetune_ckpt),  # 权重的绝对路径
         'test_time': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
         'num_classes': int(n_classes),
-        'num_samples': len(y_true)
+        'num_samples': len(y_true),
+        'detailed_results_file': os.path.abspath(detailed_results_path)  # 详细结果文件路径
     }
     
     if n_classes == 2:

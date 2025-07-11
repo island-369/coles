@@ -1,0 +1,20 @@
+{
+    "accuracy": 0.4,
+    "f1": 0.2285714285714286,
+    "confusion_matrix": [
+        [
+            0,
+            3
+        ],
+        [
+            0,
+            2
+        ]
+    ],
+    "model_weight": "/home/xqy/coles/output_finetune/finetuned_downstream.ckpt",
+    "test_time": "2025-07-08 11:39:18",
+    "num_classes": 2,
+    "num_samples": 5,
+    "detailed_results_file": "/home/xqy/coles/output_finetune_test/detailed_test_results.jsonl",
+    "auc": 0.5
+}

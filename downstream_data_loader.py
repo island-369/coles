@@ -344,27 +344,26 @@ class DistributedValTestDataset(IterableDataset):
         """批处理函数，适配二分类任务"""
         from ptls.data_load.utils import collate_feature_dict
         import torch
-        
-        # 分离样本和标签，并处理ColesDataset返回的splits列表
         all_samples = []
         all_labels = []
-        
+        all_cert_sm3 = []
         for item in batch:
-            splits, label = item[0], item[1]
-            # ColesDataset返回的是splits列表，需要展平
+            if len(item) == 3:
+                splits, label, cert_sm3 = item
+            else:
+                splits, label = item[0], item[1]
+                cert_sm3 = ''
             if isinstance(splits, list):
                 for split in splits:
                     all_samples.append(split)
                     all_labels.append(label)
+                    all_cert_sm3.append(cert_sm3)
             else:
                 all_samples.append(splits)
                 all_labels.append(label)
-        
-        # 处理特征数据
+                all_cert_sm3.append(cert_sm3)
         padded_batch = collate_feature_dict(all_samples)
-        
-        # 返回特征和标签
-        return padded_batch, torch.LongTensor(all_labels)
+        return padded_batch, torch.LongTensor(all_labels), all_cert_sm3
     
     def get_num_classes(self):
         """获取类别数量"""
@@ -460,9 +459,13 @@ class DistributedValTestDataset(IterableDataset):
                             # 构建数据集并生成样本
                             dataset = self.dataset_builder(processed)
                             
+                            # 获取cert_sm3字段
+                            cert_sm3 = user_data.get('cert_sm3', '')
+                            
                             user_sample_count = 0
                             for sample in dataset:
-                                yield (sample, label_id)
+                                # 返回样本、标签和cert_sm3
+                                yield (sample, label_id, cert_sm3)
                                 user_sample_count += 1
                             
                             user_count += 1

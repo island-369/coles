@@ -10,6 +10,8 @@
 """
 
 import torch
+import os
+import json
 import torch.nn as nn
 import torch.nn.functional as F
 import pytorch_lightning as pl
@@ -243,7 +245,18 @@ class CoLESFinetuneModule(pl.LightningModule):
         all_targets = torch.cat([x['targets'] for x in self.validation_step_outputs])
         all_probs = torch.cat([x['probs'] for x in self.validation_step_outputs])
         all_losses = torch.stack([x['loss'] for x in self.validation_step_outputs])
-        
+         
+        # ========= 记录验证情况 =========
+        output_dir = "logs_finetune"
+        os.makedirs(output_dir, exist_ok=True)
+        output_path = os.path.join(output_dir, f"val_probs_step{current_step}.jsonl")
+        with open(output_path, "w", encoding="utf-8") as f:
+            for prob, label in zip(all_probs[:, 1], all_targets): 
+                row = {"prob": float(prob), "label": int(label)}
+                f.write(json.dumps(row, ensure_ascii=False) + "\n")
+
+
+
         # 计算平均损失
         avg_loss = all_losses.mean()
         

@@ -4,8 +4,10 @@ import time
 from datetime import datetime
 import torch
 import pytorch_lightning as pl
-from pytorch_lightning.callbacks import Callback
+from pytorch_lightning.callbacks import Callback, ModelCheckpoint
 from pytorch_lightning.utilities.rank_zero import rank_zero_only
+from pytorch_lightning.profilers import SimpleProfiler
+
 
 # 1. 配置模块和特征工程导入
 from config import init_config
@@ -40,6 +42,16 @@ log_file, log_filename = setup_logging()
 def debug_print(*args, **kwargs):
     if log_file is not None:
         print(*args, file=log_file, **kwargs); log_file.flush()
+
+# ---- 定义从 DF 到 ColesDataset 的转换 ----
+def build_dataset_from_df(df):
+    return ColesDataset(
+        MemoryMapDataset(data=df, i_filters=[SeqLenFilter(min_seq_len=1,max_seq_len=5000)]),
+        
+        splitter=NoSplit(),   # 下游任务使用NoSplit，保持完整序列
+    )
+
+
 
 # 4. 下游训练流程
 def main():
@@ -78,13 +90,7 @@ def main():
         return_records=True,
     )
 
-    # ---- 定义从 DF 到 ColesDataset 的转换 ----
-    def build_dataset_from_df(df):
-        return ColesDataset(
-            MemoryMapDataset(data=df, i_filters=[SeqLenFilter(min_seq_len=1,max_seq_len=5000)]),
-            
-            splitter=NoSplit(),   # 下游任务使用NoSplit，保持完整序列
-        )
+
 
     # ---- 数据集/数据加载器（与预训练同风格，使用你自己的下游数据集类） ----
     # 训练集使用无限循环的DownstreamBinaryClassificationDataset
@@ -109,13 +115,15 @@ def main():
         train_ds,
         batch_size=batch_size,
         num_workers=1,
-        collate_fn=DownstreamBinaryClassificationDataset.collate_fn
+        collate_fn=DownstreamBinaryClassificationDataset.collate_fn,
+        persistent_workers=True
     )
     val_loader = DataLoader(
         val_ds,
         batch_size=batch_size,
         num_workers=1,
-        collate_fn=DistributedValTestDataset.collate_fn
+        collate_fn=DistributedValTestDataset.collate_fn,
+        persistent_workers=True,
     )
 
     # ---- 构建和加载模型（与预训练代码中保持一致） ----
@@ -190,7 +198,8 @@ def main():
         max_steps=max_steps,
         accelerator='gpu' if torch.cuda.is_available() else 'cpu',
         devices=2,
-        strategy='ddp',
+        strategy='ddp'
+        # strategy='deepspeed',
         enable_checkpointing=True,
         logger=False,
         enable_progress_bar=True,
@@ -201,12 +210,12 @@ def main():
 
     debug_print("开始下游Finetune训练...")
     
-    ckpt_last = './output_finetune/finetuned_downstream.ckpt' 
+    # ckpt_last = './output_finetune/finetuned_downstream.ckpt' 
     
     
     trainer.validate(downstream_model,val_loader)
     
-    trainer.fit(downstream_model, train_loader, val_loader， ckpt_path=ckpt_last)
+    trainer.fit(downstream_model, train_loader, val_loader)
     
     trainer.validate(downstream_model,val_loader)
 

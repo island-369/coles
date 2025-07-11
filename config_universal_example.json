@@ -17,7 +17,7 @@
         "learning_rate": 1e-3
     },
     "finetune_config": {
-        "max_steps": 100,
+        "max_steps": 20,
         "val_check_interval": 20,
         "learning_rate": 1e-4,
         "weight_decay": 1e-5,

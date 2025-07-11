@@ -37,9 +37,10 @@ from config import init_config
 from data_load_xqy import load_jsonl_as_dataframe_new_format, MultiFileColesIterableDataset, StreamingUserColesIterableDataset
 from pytorch_lightning.profilers import PyTorchProfiler
 import torch.profiler
-
-
-
+from pytorch_lightning.strategies import DeepSpeedStrategy
+import deepspeed
+from pytorch_lightning.plugins.environments import LightningEnvironment
+from deepspeed.ops.adam import DeepSpeedCPUAdam
 
 
 os.environ['OMP_NUM_THREADS'] = '1'
@@ -363,6 +364,21 @@ class MetricsTracker(Callback):
 
 # UniversalTrxEncoder 类已移动到独立模块 universal_trx_encoder.py 中
 
+# 定义数据集构建函数
+def build_dataset_from_df(processed_df):
+    """从预处理后的DataFrame构建ColesDataset"""
+    return ColesDataset(
+        MemoryMapDataset(
+            data=processed_df,
+            i_filters=[SeqLenFilter(min_seq_len=1)],
+        ),
+        splitter=SampleSlices(
+            split_count=5,
+            cnt_min=1,
+            cnt_max=5,
+        ),
+    )
+
 def train_continuous_coles_universal(train_dir, val_dir, config):
     """使用StreamingUserColesIterableDataset进行多个文件连续训练的CoLES模型
     
@@ -483,7 +499,8 @@ def train_continuous_coles_universal(train_dir, val_dir, config):
     # 创建CoLES模型
     model = CoLESModule(
         seq_encoder=seq_encoder,
-        optimizer_partial=partial(torch.optim.Adam, lr=learning_rate),
+        # optimizer_partial=partial(torch.optim.Adam, lr=learning_rate),
+        optimizer_partial=partial(DeepSpeedCPUAdam, lr=learning_rate),
         lr_scheduler_partial=partial(
             torch.optim.lr_scheduler.StepLR, step_size=30, gamma=0.9
         )
@@ -491,20 +508,7 @@ def train_continuous_coles_universal(train_dir, val_dir, config):
     
     print_time_point("模型创建完成", model_creation_start_time)
     
-    # 定义数据集构建函数
-    def build_dataset_from_df(processed_df):
-        """从预处理后的DataFrame构建ColesDataset"""
-        return ColesDataset(
-            MemoryMapDataset(
-                data=processed_df,
-                i_filters=[SeqLenFilter(min_seq_len=1)],
-            ),
-            splitter=SampleSlices(
-                split_count=5,
-                cnt_min=1,
-                cnt_max=5,
-            ),
-        )
+
     
     # 使用流式用户级读取数据集
     debug_print("\n=== 创建训练数据StreamingUserColesIterableDataset（流式用户级读取）===")
@@ -558,10 +562,21 @@ def train_continuous_coles_universal(train_dir, val_dir, config):
     
     # 创建Trainer（只创建一次）
     debug_print("\n=== 创建Trainer（只创建一次）===")
+    
+    safe_cluster_env = LightningEnvironment()
+
+    # 2. 在创建 DeepSpeed 策略时，把这个安全的环境对象通过 cluster_environment 参数传进去
+    deepspeed_strategy = DeepSpeedStrategy(
+        config="ds_config.json",  # 你的 DeepSpeed 配置文件
+        cluster_environment=safe_cluster_env
+    ) 
+    
     trainer = pl.Trainer(
         max_steps=60,                  # 使用max_steps而不是max_epochs控制训练
         accelerator='gpu' if torch.cuda.is_available() else 'cpu',
-        strategy='ddp',
+        # strategy='ddp',
+        # strategy='deepspeed',
+        strategy=deepspeed_strategy,
         devices=2 if torch.cuda.is_available() else 'auto',
         enable_progress_bar=True,
         callbacks=[metrics_tracker],
@@ -588,9 +603,10 @@ def train_continuous_coles_universal(train_dir, val_dir, config):
     debug_print("\n=== 保存训练结果 ===")
     
     # 保存模型
-    model_save_path = os.path.join(output_dir, 'continuous_coles_model.ckpt')
-    trainer.save_checkpoint(model_save_path)
-    debug_print(f"模型已保存到: {model_save_path}")
+    # model_save_path = os.path.join(output_dir, 'continuous_coles_model.ckpt')
+    # if trainer.is_global_zero:
+    #     trainer.save_checkpoint(model_save_path)
+    #     debug_print(f"模型已保存到: {model_save_path}")
     
     # 绘制和保存指标图表
     plot_save_path = os.path.join(output_dir, 'continuous_training_metrics.png')
