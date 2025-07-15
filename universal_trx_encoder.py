@@ -139,6 +139,8 @@ class UniversalTrxEncoder(nn.Module):
         
         # 线性投影到目标维度
         if self.projection is not None:
+            # 确保输入数据类型与线性层权重一致，避免混合精度训练时的类型不匹配错误
+            encoded = encoded.to(self.projection.weight.dtype)
             encoded = self.projection(encoded)
         
         # 5: 重新包装为PaddedBatch格式

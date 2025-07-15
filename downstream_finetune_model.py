@@ -193,6 +193,8 @@ class CoLESFinetuneModule(pl.LightningModule):
             features = features[:, 0, :]  # 取第一个token（CLS）
             # features = features.mean(dim=1)  # 平均池化
         # 分类
+        # 确保输入数据类型与线性层权重一致，避免混合精度训练时的类型不匹配错误
+        features = features.to(self.classifier.classifier[0].weight.dtype)
         logits = self.classifier(features)
         return logits
         
@@ -214,7 +216,7 @@ class CoLESFinetuneModule(pl.LightningModule):
         
     def validation_step(self, batch, batch_idx):
         """验证步骤"""
-        x, y = batch
+        x, y,_= batch
         logits = self(x)
         loss = self.criterion(logits, y)
         

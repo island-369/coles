@@ -8,3 +8,4 @@ logs_pretrain_xqy
 output_pretrain
 checkpoints
 output_finetune
+.ipynb_checkpoints

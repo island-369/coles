@@ -197,8 +197,8 @@ def main():
     trainer = pl.Trainer(
         max_steps=max_steps,
         accelerator='gpu' if torch.cuda.is_available() else 'cpu',
-        devices=2,
-        strategy='ddp'
+        devices=1,
+        strategy='ddp',
         # strategy='deepspeed',
         enable_checkpointing=True,
         logger=False,

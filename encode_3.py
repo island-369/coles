@@ -38,6 +38,9 @@ class FrequencyBasedRepresentation(nn.Module):
         sin = torch.sin(freq)  # 正弦分量
         cos = torch.cos(freq)  # 余弦分量
         feat = torch.cat([sin, cos], dim=-1)  # 拼接sin和cos，形状: (..., 2L)
+        # 确保输入数据类型与线性层权重一致，避免混合精度训练时的类型不匹配错误
+        if hasattr(self.lin, 'weight'):
+            feat = feat.to(self.lin.weight.dtype)
         return self.lin(feat)  # 线性变换到目标维度: (..., out_dim)
 
 # 字段级别的Transformer编码器
@@ -228,7 +231,10 @@ class UniversalFeatureEncoder(nn.Module):
                 # 4. 平均池化
                 emb_mean = emb_sum / denom  # (B, T, emb_dim)
                 # 5. MLP进一步处理
-                emb = self.emb_layers[f"{key}_mlp"](emb_mean)
+                mlp_layer = self.emb_layers[f"{key}_mlp"]
+                # 确保输入数据类型与线性层权重一致，避免混合精度训练时的类型不匹配错误
+                # emb_mean = emb_mean.to(mlp_layer.weight.dtype)
+                # emb = mlp_layer(emb_mean)
                 feats.append(emb)
                 
             # 数值特征处理

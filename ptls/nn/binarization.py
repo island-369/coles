@@ -22,4 +22,6 @@ class BinarizationLayer(nn.Module):
         self.linear = nn.Linear(hs_from, hs_to, bias=False)
 
     def forward(self, x):
+        # 确保输入数据类型与线性层权重一致，避免混合精度训练时的类型不匹配错误
+        # x = x.to(self.linear.weight.dtype)
         return binary(self.linear(x))

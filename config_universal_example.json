@@ -28,7 +28,7 @@
         "optimizer_type": "adam",
         "scheduler_type": null,
         "label_smoothing": 0.0,
-        "pretrained_ckpt": "./checkpoints/epoch=0-step=60.ckpt"
+        "pretrained_ckpt": "./checkpoints/epoch=0-step=60-v1.ckpt/consolidated_model.ckpt/pytorch_model.bin"
     },
     "universal_encoder_config": {
         "emb_dim_cfg": {

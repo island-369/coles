@@ -577,7 +577,7 @@ def train_continuous_coles_universal(train_dir, val_dir, config):
         # strategy='ddp',
         # strategy='deepspeed',
         strategy=deepspeed_strategy,
-        devices=2 if torch.cuda.is_available() else 'auto',
+        devices=1 if torch.cuda.is_available() else 'auto',
         enable_progress_bar=True,
         callbacks=[metrics_tracker],
         enable_checkpointing=True,
